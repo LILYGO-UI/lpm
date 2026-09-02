@@ -8,14 +8,26 @@
 
 - Python 3.11 或更高版本
 - CMake 3.21 或更高版本（包含 `ctest`、`cpack`）
-- Git（从远程模板初始化项目时需要）
+- Git（从 GitHub 直接安装或从远程模板初始化项目时需要）
 - `dpkg-deb`（发布时需要）
 - SSH 与 SCP（部署时需要）
 - LILYGO UI 模板要求的编译器、SDL2 和交叉编译环境
 
 ## 安装
 
-从当前源码安装：
+直接从 GitHub 安装：
+
+```sh
+# 使用 pip 安装
+python3 -m pip install "git+https://github.com/LILYGO-UI/lpm.git"
+lpm --version
+
+# 推荐使用 uv 进行安装
+uv tool install "git+https://github.com/LILYGO-UI/lpm.git"
+lpm --version
+```
+
+也可以从当前源码安装：
 
 ```sh
 uv tool install .
@@ -159,8 +171,8 @@ Pages 快照。
 由于中央工作流没有第三方 Fork 的私有凭证，暂存 prerelease 必须公开。
 `unpublish` 同样创建 Pull Request；它保留历史记录与 Debian 文件，只把选定版本
 改为 `yanked`。如需使用已有 Token，可设置 `GH_TOKEN`，否则 LPM 使用 `lpm login`
-保存的凭证。登录通过 GitHub OAuth Device Flow 完成，不依赖 GitHub CLI；需要用
-`LPM_GITHUB_CLIENT_ID` 指定已启用 Device Flow 的 OAuth App。在第三方项目的
+保存的凭证。登录通过内置的 LILYGO OAuth App 执行 GitHub OAuth Device Flow，不依赖
+GitHub CLI；开发时可用 `LPM_GITHUB_CLIENT_ID` 覆盖其 Client ID。在第三方项目的
 GitHub Actions 中，应把具备公开仓库权限的用户 PAT
 保存为仓库 Secret，并以 `GH_TOKEN` 注入；工作流自动获得的 `GITHUB_TOKEN` 只对
 应用源码仓库有效，不能写入用户的 `packages` Fork。

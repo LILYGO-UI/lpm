@@ -25,7 +25,7 @@ GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
 GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
 GITHUB_OAUTH_SCOPE = "public_repo"
 GITHUB_CLIENT_ID_ENV = "LPM_GITHUB_CLIENT_ID"
-DEFAULT_GITHUB_CLIENT_ID = ""
+DEFAULT_GITHUB_CLIENT_ID = "Ov23li2je0k6yeO2cisv"
 
 
 def github_login(

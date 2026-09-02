@@ -8,14 +8,26 @@ English | [简体中文](README_CN.md)
 
 - Python 3.11 or later
 - CMake 3.21 or later, including `ctest` and `cpack`
-- Git, when initializing a project from a remote template
+- Git, when installing directly from GitHub or initializing a project from a remote template
 - `dpkg-deb` when publishing
 - SSH and SCP, when deploying
 - The compiler, SDL2, and cross-compilation environment required by the LILYGO UI template
 
 ## Installation
 
-Install from the current source tree:
+Install directly from GitHub:
+
+```sh
+# Install using pip
+python3 -m pip install "git+https://github.com/LILYGO-UI/lpm.git"
+lpm --version
+
+# It is recommended to use uv for installation.
+uv tool install "git+https://github.com/LILYGO-UI/lpm.git"
+lpm --version
+```
+
+Alternatively, install from the current source tree:
 
 ```sh
 uv tool install .
@@ -163,12 +175,12 @@ The staging prerelease is necessarily public because the central workflow has no
 private credential for a contributor's fork. `unpublish` also opens a pull
 request; it preserves the historical record and Debian asset while changing the
 selected version to `yanked`. Set `GH_TOKEN` to use an existing token instead of
-the credentials saved by `lpm login`. Login uses GitHub OAuth Device Flow and
-requires `LPM_GITHUB_CLIENT_ID` to identify an OAuth App with Device Flow enabled;
-it does not require GitHub CLI. In a third-party GitHub Actions workflow, store
-a user PAT with public-repository access as a repository secret and expose it as
-`GH_TOKEN`; that workflow's automatic `GITHUB_TOKEN` is scoped to the application
-repository and cannot write the user's `packages` fork.
+the credentials saved by `lpm login`. Login uses the bundled LILYGO OAuth App
+through GitHub OAuth Device Flow; `LPM_GITHUB_CLIENT_ID` can override its Client
+ID for development, and GitHub CLI is not required. In a third-party GitHub
+Actions workflow, store a user PAT with public-repository access as a repository
+secret and expose it as `GH_TOKEN`; that workflow's automatic `GITHUB_TOKEN` is
+scoped to the application repository and cannot write the user's `packages` fork.
 
 ## Project Configuration
 

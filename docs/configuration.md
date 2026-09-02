@@ -333,14 +333,16 @@ Include ~/.ssh/config
 2. `GITHUB_TOKEN` 环境变量。
 3. `${XDG_CONFIG_HOME:-~/.config}/lpm/credentials.json` 中由 `lpm login` 保存的 Token。
 
-`lpm login` 使用 GitHub OAuth Device Flow，不依赖 `gh`。它需要一个在 GitHub OAuth
-App 设置中启用了 Device Flow 的 Client ID。Client ID 不是 Secret；当前源码通过
-`LPM_GITHUB_CLIENT_ID` 配置：
+`lpm login` 使用 GitHub OAuth Device Flow，不依赖 `gh`。LPM 内置了由
+`LILYGO-UI` 组织持有且已启用 Device Flow 的 OAuth App Client ID。Client ID 不是
+Secret；开发或测试其他 OAuth App 时可通过 `LPM_GITHUB_CLIENT_ID` 覆盖：
 
 ```sh
-# 本机交互登录
-export LPM_GITHUB_CLIENT_ID="<oauth-app-client-id>"
+# 使用内置 Client ID 进行本机交互登录
 lpm login
+
+# 可选：开发时覆盖内置 Client ID
+LPM_GITHUB_CLIENT_ID="<oauth-app-client-id>" lpm login
 
 # CI 中由 Secret 注入，不写入 lpm.toml
 GH_TOKEN="$LPM_PUBLISH_TOKEN" lpm publish dist/application.deb

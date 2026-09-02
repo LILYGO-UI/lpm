@@ -108,9 +108,17 @@ class GitHubAuthenticationTests(unittest.TestCase):
         with self.assertRaisesRegex(LpmError, "authorization was denied"):
             github_login(client_id="client-id", output=io.StringIO())
 
-    def test_login_requires_configured_oauth_client(self) -> None:
-        with self.assertRaisesRegex(LpmError, "LPM_GITHUB_CLIENT_ID"):
+    @patch("lpm.github._oauth_request", side_effect=LpmError("stop"))
+    def test_login_uses_bundled_oauth_client(self, request) -> None:
+        with self.assertRaisesRegex(LpmError, "stop"):
             github_login(output=io.StringIO())
+        request.assert_called_once_with(
+            "https://github.com/login/device/code",
+            {
+                "client_id": "Ov23li2je0k6yeO2cisv",
+                "scope": "public_repo",
+            },
+        )
 
     @patch("lpm.github.urlopen")
     def test_oauth_request_posts_form_and_requests_json(self, urlopen) -> None:

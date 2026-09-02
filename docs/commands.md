@@ -380,20 +380,22 @@ lpm login
 
 LPM 直接执行 GitHub OAuth Device Flow，不依赖 GitHub CLI：
 
-1. 从 `LPM_GITHUB_CLIENT_ID` 读取已启用 Device Flow 的 GitHub OAuth App Client ID。
+1. 使用内置的 LILYGO GitHub OAuth App Client ID；若设置了
+   `LPM_GITHUB_CLIENT_ID`，则使用该值覆盖内置配置。
 2. 请求 `public_repo` 权限，并在终端显示一次性验证码和验证地址。
 3. 尝试打开浏览器；浏览器未自动打开时，可手工访问终端显示的地址。
 4. 按 GitHub 返回的间隔轮询授权结果；遇到 `slow_down` 时自动延长轮询间隔。
 5. 授权成功后，把 Token 保存到
    `${XDG_CONFIG_HOME:-~/.config}/lpm/credentials.json`。
 
-OAuth App Client ID 不是 Secret，可以由正式发行版内置；当前源码未内置 Client ID，
-因此运行前必须设置：
+OAuth App Client ID 不是 Secret，正式发行版已内置由 `LILYGO-UI` 组织持有的 Client
+ID，因此用户可以直接登录：
 
 ```sh
-export LPM_GITHUB_CLIENT_ID="<oauth-app-client-id>"
 lpm login
 ```
+
+开发或测试其他 OAuth App 时，可设置 `LPM_GITHUB_CLIENT_ID` 覆盖内置值。
 
 LPM 创建凭证目录时使用 `0700` 权限，凭证文件使用 `0600` 权限。再次登录会原子替换
 已有 Token。`publish` 和 `unpublish` 按 `GH_TOKEN`、`GITHUB_TOKEN`、LPM 凭证文件的
