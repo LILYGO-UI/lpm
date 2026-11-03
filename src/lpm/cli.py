@@ -29,7 +29,7 @@ from .registry import publish, unpublish
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lpm",
-        description="Build, test, package, and deploy LILYGO UI applications.",
+        description="Build, test, package, and deploy LILYGO UI applications and runtimes.",
     )
     parser.add_argument("--version", action="version", version=f"lpm {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("--user", help="SSH user")
     deploy_parser.add_argument("--port", type=int, help="SSH port")
     deploy_parser.add_argument(
-        "--no-sudo", action="store_true", help="run dpkg without sudo"
+        "--no-sudo", action="store_true", help="run apt-get without sudo"
     )
     deploy_parser.set_defaults(handler=_handle_deploy)
 
@@ -136,6 +136,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     publish_parser.add_argument(
         "package", nargs="?", type=Path, help="package; defaults to newest in dist"
+    )
+    publish_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="replace a yanked version with a package of the same architecture",
+    )
+    publish_parser.add_argument(
+        "--runtime",
+        action="store_true",
+        help="publish the Debian package as a runtime record",
     )
     publish_parser.set_defaults(handler=_handle_publish)
 
@@ -267,7 +277,10 @@ def _handle_login(args: argparse.Namespace) -> int:
 
 
 def _handle_publish(args: argparse.Namespace) -> int:
-    submission = publish(find_project(), package_path=args.package)
+    options = {"package_path": args.package, "force": args.force}
+    if args.runtime:
+        options["runtime"] = True
+    submission = publish(find_project(), **options)
     print(f"Submission: {submission.pull_request_url}")
     print("Status: pending_review")
     return 0

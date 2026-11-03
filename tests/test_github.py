@@ -116,7 +116,7 @@ class GitHubAuthenticationTests(unittest.TestCase):
             "https://github.com/login/device/code",
             {
                 "client_id": "Ov23li2je0k6yeO2cisv",
-                "scope": "public_repo",
+                "scope": "public_repo workflow",
             },
         )
 
@@ -128,14 +128,14 @@ class GitHubAuthenticationTests(unittest.TestCase):
 
         payload = _oauth_request(
             "https://github.com/login/device/code",
-            {"client_id": "client-id", "scope": "public_repo"},
+            {"client_id": "client-id", "scope": "public_repo workflow"},
         )
 
         request = urlopen.call_args.args[0]
         self.assertEqual(payload, {"device_code": "code"})
         self.assertEqual(
             parse_qs(request.data.decode("ascii")),
-            {"client_id": ["client-id"], "scope": ["public_repo"]},
+            {"client_id": ["client-id"], "scope": ["public_repo workflow"]},
         )
         self.assertEqual(request.get_header("Accept"), "application/json")
 
@@ -153,6 +153,35 @@ class GitHubAuthenticationTests(unittest.TestCase):
             client = GitHubClient.authenticated()
         self.assertEqual(client.token, "environment-token")
         read_token.assert_not_called()
+
+    def test_api_error_includes_request_endpoint(self) -> None:
+        error = GitHubClient._http_error(
+            404,
+            b'{"message":"Not Found"}',
+            method="GET",
+            url="https://api.github.com/repos/LILYGO-UI/packages",
+        )
+        self.assertEqual(
+            str(error),
+            "GitHub API request failed with HTTP 404: Not Found "
+            "(GET https://api.github.com/repos/LILYGO-UI/packages)",
+        )
+
+    @patch("lpm.github.urlopen")
+    def test_sync_fork_posts_upstream_branch(self, urlopen) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{}'
+        response.__enter__.return_value.status = 200
+        urlopen.return_value = response
+
+        GitHubClient("token").sync_fork("alice/packages", branch="main")
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "https://api.github.com/repos/alice/packages/merge-upstream",
+        )
+        self.assertEqual(json.loads(request.data), {"branch": "main"})
 
 
 if __name__ == "__main__":

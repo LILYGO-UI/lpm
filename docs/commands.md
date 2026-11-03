@@ -10,7 +10,11 @@
 2. 当前级没有 `lpm.toml`，但有 `CMakeLists.txt` 时，把该目录识别为旧 CMake 项目，并使用空配置和工作流默认值；不会继续寻找更上层的 `lpm.toml`。
 3. 两者都找不到时，命令失败并报告当前目录不属于 LPM 或 CMake 项目。
 
-所有 CMake、CTest、CPack、Git、SSH 和 SCP 子进程都以项目根目录或明确的临时目录作为工作目录。LPM 不通过 shell 拼接本地命令，而是以参数数组直接启动进程，保留子进程的标准输出和标准错误。
+所有 CMake、CTest、CPack、项目脚本、Git、SSH 和 SCP 子进程都以项目根目录或明确的临时目录作为工作目录。LPM 不通过 shell 拼接本地命令，而是以参数数组直接启动进程，保留子进程的标准输出和标准错误。
+
+`project.kind` 默认为 `application`；`runtime` 项目支持 `test`、`pack`、`deploy`、`metadata`、`publish` 和 `unpublish`，并对 `start`、`stop` 明确报错。运行库只声明包名与工作流，版本和架构由原生打包工具写入 Debian control 字段；发布记录写入 packages registry 的 `runtimes/<package>/`。运行库的 `metadata --format publish-json` 输出本地身份快照，包含 `schema_version`、`kind` 和 `package`；完整版本清单仍由 `publish` 从 `.deb` 读取。
+
+`build.backend` 默认为 `cmake`；设置 `script` 时，`test` 和 `pack` 使用项目命令数组，流程见各命令的脚本后端说明。`start` 只支持 CMake 应用。应用身份和发布元数据仍由应用的 `lpm.toml` 维护。
 
 ### 配置优先级
 
@@ -35,12 +39,12 @@ LPM 在使用外部工具前通过当前 `PATH` 查找可执行文件。找不�
 | LPM 命令 | 外部命令 |
 | --- | --- |
 | `init` | 远程模板需要 `git`；本地模板不需要 |
-| `start` | 构建时需要 `cmake`；`--no-build` 不需要 |
+| `start` | 构建时需要 `cmake`；`--no-build` 不需要；配置的 `[run].prepare_command` 使用其数组中的程序 |
 | `stop` | Unix 信号；进程校验可能调用 `ps` |
-| `test` | `cmake`、`ctest` |
-| `pack` | `cmake`、`cpack` |
+| `test` | CMake 后端：`cmake`、`ctest`；脚本后端：`build.test_command` 指定的程序 |
+| `pack` | CMake 后端：`cmake`、`cpack`；脚本后端：`build.pack_command` 指定的程序 |
 | `metadata` | 无 |
-| `deploy` | `scp`、`ssh`；远端需要 `dpkg`，默认还需要 `sudo` |
+| `deploy` | `scp`、`ssh`；远端需要 `apt-get`，默认还需要 `sudo` |
 | `login` | 无；通过 HTTPS 执行 GitHub OAuth Device Flow |
 | `publish` | `dpkg-deb` |
 | `unpublish` | 无 |
@@ -58,14 +62,14 @@ LPM 在使用外部工具前通过当前 `PATH` 查找可执行文件。找不�
 | --- | --- | --- | --- |
 | `lpm init` | 从模板创建独立应用项目 | 路径、名称、版本、描述、模板 | 新项目目录和定制后的 `lpm.toml` |
 | `lpm metadata` | 校验并派生项目元数据 | `lpm.toml [project]` | CMake 文本或 publish JSON |
-| `lpm start` | 构建并运行主机模拟器 | host preset、可执行文件、运行参数 | 模拟器进程、日志和 PID 状态 |
+| `lpm start` | 构建、准备并运行主机模拟器 | host preset、可执行文件、运行参数、`[run]` | 模拟器进程、日志和 PID 状态 |
 | `lpm stop` | 安全停止后台模拟器 | PID 状态、超时 | 清理模拟器 PID 状态 |
-| `lpm test` | 构建并运行主机测试 | host preset、报告路径 | JUnit XML 报告 |
-| `lpm pack` | 交叉构建并生成 Debian 包 | cross preset、输出目录 | 一个或多个 `.deb` |
+| `lpm test` | 运行项目测试 | host preset 或脚本命令、报告路径 | JUnit XML 报告 |
+| `lpm pack` | 构建并生成 Debian 包 | cross preset 或脚本命令、输出目录 | 一个或多个 `.deb` |
 | `lpm deploy` | 上传并安装已有 Debian 包 | 包路径、SSH 目标 | 目标设备上的已安装包 |
 | `lpm login` | 登录 GitHub | OAuth App Client ID、浏览器授权 | LPM 管理的 GitHub 凭证文件 |
-| `lpm publish` | 提交应用版本审核 | `lpm.toml`、`.deb`、资源文件 | Fork prerelease 与发布 PR |
-| `lpm unpublish` | 请求下架某个版本 | 版本号、公开原因 | 将版本改为 `yanked` 的 PR |
+| `lpm publish` | 提交应用或运行库版本审核 | `lpm.toml`、`.deb`、应用资源文件；运行库使用 `--runtime` | Fork prerelease 与发布 PR |
+| `lpm unpublish` | 请求下架某个应用或运行库版本 | 版本号、公开原因 | 将版本改为 `yanked` 的 PR |
 
 ## `lpm init`
 
@@ -125,12 +129,13 @@ lpm metadata --format cmake|publish-json [--output PATH]
 ### 执行流程
 
 1. 发现项目并加载 `lpm.toml`。
-2. 要求 `schema_version = 1` 和完整 `[project]`。
+2. 应用项目要求 `schema_version = 1` 和完整 `[project]`；runtime 项目只要求 `kind = "runtime"` 和合法的 `package`。
 3. 校验包名、版本、应用 ID、作者、分类、资源、权限、兼容性和 Launcher 顺序。
 4. 检查图标和所有截图文件真实存在。
 5. 根据 `--format` 渲染：
    - `cmake`：生成一组 `set(LILYGO_UI_...)` 变量，供模板配置阶段 include。
-   - `publish-json`：生成符合 publish schema 的 JSON，不包含 `[build]`、`[deploy]` 或旧版 `project.executable`。
+   - `publish-json`：应用项目生成符合 publish schema 的 JSON，不包含 `[build]`、`[deploy]` 或旧版 `project.executable`；runtime 项目生成包含 `schema_version`、`kind` 和 `package` 的本地身份快照。
+   - runtime 项目的版本、架构、大小和 SHA-256 在 `publish` 阶段从 `.deb` 读取。
 6. 未指定 `--output` 时写到 stdout；指定后创建父目录并写入该文件。
 
 `--output` 是相对于执行命令时工作目录解析的路径。`publish.json` 是临时派生产物，不是新的配置入口。
@@ -141,7 +146,7 @@ lpm metadata --format cmake|publish-json [--output PATH]
 
 ## 共享构建阶段
 
-`start`、`test` 和 `pack` 都复用同一个 configure/build 流程：
+默认 CMake 后端中，`start`、`test` 和 `pack` 复用同一个 configure/build 流程：
 
 ```sh
 cmake --preset <preset>
@@ -173,7 +178,11 @@ lpm start \
 4. 相对可执行文件名在 `build/<preset>/` 下查找；直接路径不存在时，会递归查找同名且可执行的文件。
 5. 只有一个可执行匹配时使用它；没有唯一结果时失败。
 6. `--` 后的参数原样传给模拟器。
-7. 根据运行模式进入前台或后台流程。
+7. 后台模式检查已有模拟器状态；如果同一个模拟器仍在运行，直接失败，不执行准备命令。
+8. 如果配置了 `[run].prepare_command`，执行准备命令；命令返回非零时，启动流程停止，模拟器不会启动。
+9. 根据运行模式进入前台或后台流程。
+
+准备命令和模拟器都接收 `[run].environment`。项目值只提供默认值，当前 shell 中已经存在的同名变量优先；`{python}` 和 `{project}` 可用于命令参数及环境值。LPM 不通过 shell 执行准备命令，因此管道、重定向和变量展开必须由项目自己的脚本处理。
 
 ### 前台模式
 
@@ -246,6 +255,18 @@ ctest --preset <preset> \
 
 默认报告是 `<project>/.lpm/test-results.xml`。显式 `--report` 相对于执行命令时的工作目录解析。任何测试失败都会使 `ctest` 返回非零，LPM 随即以失败结束。
 
+### 脚本后端
+
+设置 `build.backend = "script"` 后跳过 CMake 和 CTest：
+
+1. 拒绝 `--preset`，要求非空的 `build.test_command` 参数数组及独立的 `{report}` 参数。
+2. 解析报告的绝对路径并创建父目录；旧报告不能充当本次结果。
+3. 将独立参数 `{python}` 替换为运行 LPM 的解释器，`{report}` 替换为报告路径。
+4. 从项目根目录直接执行参数数组，不经过 shell，不展开 shell 变量或嵌入字符串的占位符。
+5. 要求命令成功，并且本次写出至少含一个 `testcase` 的有效 JUnit XML 报告；缺失、空白或无效报告，以及报告中的失败或错误，都会使测试失败。记录为 skipped 的用例允许通过。
+
+例如 `test_command = ["{python}", "tools/lpm-workflow.py", "test", "--report", "{report}"]`。测试运行器和报告生成由该脚本负责。
+
 ## `lpm pack`
 
 ```sh
@@ -269,6 +290,18 @@ cpack --config build/<preset>/CPackConfig.cmake -B <output>
 
 CPack 成功但没有发现新的 Debian 包时，LPM 仍判定 `pack` 失败。LPM 当前只返回 `.deb`，不会把其他 CPack generator 的产物作为成功结果。
 
+### 脚本后端
+
+设置 `build.backend = "script"` 后跳过 CMake 和 CPack：
+
+1. 拒绝 `--preset`，要求非空的 `build.pack_command` 参数数组及独立的 `{output}` 参数。
+2. 按 `--output`、`build.package_dir`、`dist` 选择输出目录，解析为绝对路径并创建目录。
+3. 记录目录内已有包，将独立参数 `{python}` 替换为运行 LPM 的解释器，`{output}` 替换为输出目录。
+4. 从项目根目录直接执行参数数组，不经过 shell。
+5. 只收集本次新增或更新的 `.deb`；未变化的已有文件不计入结果。命令成功但没有产生包时仍报告失败。
+
+例如 `pack_command = ["{python}", "tools/lpm-workflow.py", "pack", "--output-dir", "{output}"]`。项目脚本自行管理 Meson、交叉编译工具链、版本、许可证及 Debian 元数据。输出目录选择和 CLI 列出包路径的行为与 CMake 后端相同。
+
 ## `lpm deploy`
 
 ```sh
@@ -279,7 +312,7 @@ lpm deploy [PACKAGE.deb] \
   [--no-sudo]
 ```
 
-`deploy` 只安装已有包，不会自动执行 `pack`。
+`deploy` 只安装已有包，不会自动执行 `pack`。应用和运行库使用相同流程；远端通过 `apt-get install --reinstall --yes <PACKAGE.deb>` 强制安装上传的本地包，即使已安装版本相同，并从目标机已配置的软件源解析缺失依赖。LPM 不会更新软件包索引、启用 Meshtasticd 运行库或修改、重启服务；设备或 pi-gen 镜像仍需准备软件源和服务配置。
 
 ### 包选择
 
@@ -335,24 +368,25 @@ scp [SSH_OPTIONS] <package> <user@host:/tmp/lpm-....deb>
 3. 通过 SSH 执行远端命令：
 
 ```sh
-set -e; sudo -- dpkg --install /tmp/lpm-....deb; rm -f -- /tmp/lpm-....deb
+ssh [SSH_OPTIONS] <user@host> 'set -e; sudo -- apt-get install --reinstall --yes /tmp/lpm-....deb; rm -f -- /tmp/lpm-....deb'
 ```
 
 `--no-sudo` 会移除 `sudo --`。远端参数经过 shell quoting，避免包路径被解释为额外命令。
+启用 sudo 时，LPM 会为 SSH 请求伪终端（`-tt`），使目标机的 sudo 可以在交互部署中读取密码；LPM 不读取或保存该密码。自动化环境应配置目标用户的免密 sudo，或使用已有 root 权限的用户并传入 `--no-sudo`。
 
-只有安装成功后才执行远端清理。若 SCP 成功但 SSH、sudo 或 dpkg 失败，LPM 返回失败，远端临时包可能保留在 `/tmp`，需要人工检查。LPM 不做安装回滚，也不会自动卸载旧版本。
+只有安装成功后才执行远端清理。若 SCP 成功但 SSH、sudo 或 apt-get 失败，LPM 返回失败，远端临时包可能保留在 `/tmp`，需要人工检查。APT 只能从目标机已配置的软件源获取依赖，LPM 不会运行 `apt-get update`。LPM 不做安装回滚，也不会自动卸载旧版本。
 
 ## 状态文件与产物
 
 | 路径 | 创建者 | 生命周期与用途 |
 | --- | --- | --- |
-| `lpm.toml` | 模板、`init` | 唯一人工维护的项目与工作流配置 |
+| `lpm.toml` | 模板、`init`、开发者 | 应用身份和发布信息的唯一入口；运行库包名及工作流配置 |
 | `.lpm/simulator.json` | 后台 `start` | 当前模拟器 PID 和身份；成功 `stop` 后删除 |
 | `.lpm/simulator.log` | 后台 `start` | 模拟器 stdout/stderr，采用追加写入 |
-| `.lpm/test-results.xml` | `test` | 默认 JUnit 报告，可由 `--report` 覆盖 |
+| `.lpm/test-results.xml` | `test` / 项目测试脚本 | 默认 JUnit 报告，可由 `--report` 覆盖 |
 | `.lpm/ssh_config` | 开发者 | 项目级 OpenSSH 配置，LPM 只读取 |
 | `build/<preset>/` | CMake | 配置与构建输出，LPM 不主动清理 |
-| `dist/*.deb` | `pack`/CPack | 默认 Debian 包输出；目录可配置或覆盖 |
+| `dist/*.deb` | `pack` / CPack / 项目打包脚本 | 默认 Debian 包输出；目录可配置或覆盖 |
 | `publish.json` | `metadata` | 可选的临时派生清单，应忽略且不提交 |
 
 ## 退出状态与错误处理
@@ -382,7 +416,7 @@ LPM 直接执行 GitHub OAuth Device Flow，不依赖 GitHub CLI：
 
 1. 使用内置的 LILYGO GitHub OAuth App Client ID；若设置了
    `LPM_GITHUB_CLIENT_ID`，则使用该值覆盖内置配置。
-2. 请求 `public_repo` 权限，并在终端显示一次性验证码和验证地址。
+2. 请求 `public_repo` 和 `workflow` 权限，并在终端显示一次性验证码和验证地址。
 3. 尝试打开浏览器；浏览器未自动打开时，可手工访问终端显示的地址。
 4. 按 GitHub 返回的间隔轮询授权结果；遇到 `slow_down` 时自动延长轮询间隔。
 5. 授权成功后，把 Token 保存到
@@ -409,7 +443,7 @@ LPM 创建凭证目录时使用 `0700` 权限，凭证文件使用 `0600` 权限
 ## `lpm publish`
 
 ```sh
-lpm publish [PACKAGE.deb]
+lpm publish [PACKAGE.deb] [--runtime] [--force]
 ```
 
 未指定包时，按 `deploy` 相同的规则选择 `build.package_dir` 中修改时间最新的
@@ -426,20 +460,49 @@ lpm publish [PACKAGE.deb]
 5. 图标和截图改写为 `assets/sha256/<prefix>/<digest>.<ext>`，避免不同版本覆盖
    同名资源。图标最大 1 MiB，单张截图最大 2 MiB。
 
+`project.compatibility.architectures` 必须恰好包含一个架构名，例如 `["amd64"]`、
+`["armhf"]` 或 `["all"]`。`all` 必须与包内字段精确匹配；`source`、`any`
+和架构通配符不适用于发布的二进制包。完整名称规则见 [配置文档](configuration.md)。
+中央 `packages` 的架构 schema 更新必须先合并到默认分支，新架构发布 PR 才能通过
+受信任的基础版本校验。
+
 ### GitHub 阶段
 
 1. 读取 `LILYGO-UI/packages` 默认分支和当前 GitHub 用户。
-2. 创建或复用 `<user>/packages` Fork，并确认它的 parent/source 是中央仓库。
+2. 创建或复用 `<user>/packages` Fork，并确认它的 parent/source 是中央仓库；如果 Fork 的默认分支落后于中央默认分支，先执行快进同步。
 3. 从中央默认分支创建唯一发布分支，提交 `app.json`、版本记录和资源。
 4. 在 Fork 创建公开 prerelease，把 `.deb` 作为 Release asset 上传。
 5. 向中央默认分支创建发布 Pull Request，输出 URL 和 `pending_review` 状态。
 
 首次发布会创建应用所有权文件，唯一 owner 是 PR 作者。已有应用要求当前 GitHub
-用户在 owner 列表中。同一个版本文件一旦存在便拒绝覆盖，即使该版本已下架。
+用户在 owner 列表中。默认拒绝覆盖已存在的版本，即使该版本已下架。
+每个包版本仍只对应一个当前 DEB，不能用另一架构替换。
 
 Fork prerelease 是审核暂存区，不是 AppStore 的正式下载位置。PR 合并后，中央仓库
 Action 会重新下载并验证包，把它转存到 `apt-pool-<package>` Release；只有转存
 成功并确认所有 `published` asset 存在后才部署 Pages。
+
+### 同版本替换已下架的包
+
+```sh
+lpm unpublish 1.0.0 --reason "Critical startup failure"
+# 等待下架 PR 合并，重新构建同版本的新包后：
+lpm publish --force dist/lilygo-ui-demo_1.0.0_arm64.deb
+```
+
+`--force` 只允许替换中央默认分支上已处于 `yanked` 状态的版本，不能直接覆盖
+`published` 或 `revoked` 版本。包名、版本号、应用 ID 和架构必须与旧记录一致，
+本地 `project.version` 与新 DEB 的 `Version` 也必须一致；manifest 的其他内容
+和包文件可更新。版本尚不存在时，`--force` 按普通发布处理。
+
+替换仍创建审核 PR，在说明中列出旧、新 SHA-256。新版本记录清除下架信息并改为
+`published`；合并后中央工作流校验新包、上传新的 SHA-256 下载路径并更新 Pages。
+旧 DEB 与旧 Git 记录保留，不会用新内容覆盖旧哈希地址。
+
+中央校验器的同版本替换支持必须先合并到 `packages/main`，再创建替换 PR。
+PR 校验使用基础提交中的受信任代码，仅重跑旧工作流不会切换到新校验器；已有
+发布分支需要更新到新的默认分支后重新触发检查。版本号未变，只按版本号判断
+升级的客户端需要显式重新安装新包。
 
 ## `lpm unpublish`
 

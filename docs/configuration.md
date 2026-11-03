@@ -1,13 +1,14 @@
 # LPM 配置参考
 
 LPM 从当前目录向父目录查找最近的 `lpm.toml`。它是当前 LILYGO UI
-应用唯一需要人工维护的元数据入口，同时包含公开的产品与发布信息，以及仅在本地使用的构建、部署配置。各命令如何消费这些配置见[命令业务逻辑](commands.md)。
+应用唯一需要人工维护的元数据入口，同时包含公开的产品与发布信息，以及仅在本地使用的构建、部署配置。运行库使用 `project.kind = "runtime"`，可仅记录包名和本地工作流，将版本与 Debian 元数据留在自身打包工具中。各命令如何消费这些配置见[命令业务逻辑](commands.md)。
 
 相对路径的解析规则：
 
 - `lpm.toml` 中的资源路径和 `build.package_dir` 相对于项目根目录。
 - 命令行传入的 `--output`、`--report` 等路径相对于执行命令时的工作目录。
 - CMake preset 名称直接交给项目根目录下的 CMake 处理。
+- 脚本命令的工作目录是项目根目录，`{report}` 和 `{output}` 均展开为绝对路径。
 
 ## 完整示例
 
@@ -73,8 +74,8 @@ port = 22
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `schema_version` | integer | 是 | `lpm.toml` 格式版本，当前必须为 `1` |
-| `project` | table | 发布与当前模板构建时必填 | 应用身份、发布信息和派生元数据 |
-| `build` | table | 否 | 构建 preset 和包输出目录；缺失字段使用默认值 |
+| `project` | table | 当前模板构建、应用发布及运行库项目必填 | 项目类型；应用身份与发布信息，或运行库包名 |
+| `build` | table | 否 | CMake preset 或脚本工作流，以及包输出目录；缺失字段使用默认值 |
 | `deploy` | table | 否 | 默认 SSH 部署目标；缺失或空值使用默认值 |
 
 `schema_version` 描述的是 `lpm.toml` 格式。生成的 publish JSON 也包含独立的
@@ -82,10 +83,14 @@ port = 22
 
 ## `[project]`
 
+`kind` 接受 `"application"` 或 `"runtime"`，省略时为 `"application"`。
+应用的字段要求如下；运行库使用后面的[运行库配置](#运行库配置)。
+
 ### 基本字段
 
 | 字段 | 类型 | 必填 | 约束与用途 |
 | --- | --- | --- | --- |
+| `kind` | string | 否 | 项目类型，默认 `"application"` |
 | `package` | string | 是 | Debian 包名和默认可执行文件名；匹配 `lilygo-ui-[a-z0-9]+(-[a-z0-9]+)*`，最长 128 字符 |
 | `version` | string | 是 | Debian 兼容版本，最长 128 字符；例如 `1.0.0`、`1.0.0-rc.1` 或 `1:1.0.0-1` |
 | `app_id` | string | 是 | 稳定应用 ID；匹配 `cc.lilygo.ui.<PascalCase>`，最长 255 字符 |
@@ -181,10 +186,17 @@ external-display
 
 | 字段 | 类型 | 必填 | 约束 |
 | --- | --- | --- | --- |
-| `architectures` | string array | 是 | 当前必须精确为 `["arm64"]` |
+| `architectures` | string array | 是 | 恰好一个架构名，例如 `["arm64"]`、`["amd64"]`、`["armhf"]`、`["riscv64"]` 或 `["all"]` |
 | `min_appkit_version` | string | 是 | 最低 AppKit 版本，最长 128 字符；格式为三段版本号，可带 prerelease 和 build 信息 |
 
 合法示例包括 `0.1.0`、`1.2.0-rc.1` 和 `1.2.0+build.4`。
+
+架构名最长 64 字符，由小写字母、数字和分隔各段的单个连字符组成；
+支持 `hurd-i386` 这类名称。不维护 CPU 名称白名单，但拒绝 `source`、`any`
+以及 `linux-any`、`any-amd64` 等含 `any` 段的架构通配符。
+发布时还会检查 DEB 的 `Architecture` 与配置精确一致。
+架构无关包必须声明 `["all"]`，不会自动匹配声明为 `["arm64"]` 的项目。
+每个包版本仍只存储一个 DEB，不能用另一架构覆盖或追加已存在的同一版本。
 
 ### `[project.launcher]`
 
@@ -195,7 +207,36 @@ external-display
 运行 `lpm metadata`、`lpm init` 的模板校验或当前模板的 CMake 配置时，
 `[project]`、作者、资源、截图、权限、兼容性和 Launcher 表中的未知字段会被拒绝，以避免拼写错误被静默忽略。
 
+## 运行库配置
+
+运行库的 `[project]` 只接受 `kind` 和 `package`；包名使用合法的 Debian 包名。它不要求应用 ID、图标、截图或 Launcher 信息，也不从应用发布格式生成 Debian 元数据。运行库版本由自身的构建和打包配置维护，例如 Meshtasticd 的版本和 Debian 打包修订号。
+
+```toml
+schema_version = 1
+
+[project]
+kind = "runtime"
+package = "meshtasticd"
+
+[build]
+backend = "script"
+package_dir = "dist"
+test_command = ["{python}", "tools/lpm-workflow.py", "test", "--report", "{report}"]
+pack_command = ["{python}", "tools/lpm-workflow.py", "pack", "--output-dir", "{output}"]
+
+[deploy]
+host = "raspberrypi.local"
+user = "pi"
+port = 22
+```
+
+运行库支持 `test`、`pack`、`deploy`、`metadata`、`publish` 和 `unpublish`。`start`、`stop` 会明确报错，不会要求补充应用身份。`metadata --format publish-json` 输出本地运行库身份快照；版本和架构仍由 `publish` 从 Debian control 字段读取。`init` 仍用于从应用模板初始化应用。运行库发布提交 packages registry 的 `runtimes/<package>/` 记录。
+
 ## 派生输出
+
+应用项目的派生输出包含完整的发布清单和 CMake 身份变量。运行库项目也可以使用
+`lpm metadata --format publish-json` 或 `--format cmake`，但只输出运行库身份；版本、
+架构、文件大小和 SHA-256 必须从实际 `.deb` 读取。
 
 开发者不应再维护独立的 `publish.json`、应用身份 CMake 文件或在 `data/`
 模板中重复填写产品信息。LPM 从 `[project]` 生成两类输出：
@@ -259,12 +300,15 @@ LILYGO_UI_CATEGORIES
 
 ## `[build]`
 
-所有字段可省略，并使用表中的默认值：
+CMake 后端的字段可省略，并使用表中的默认值。脚本后端需提供对应工作流的命令数组：
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `host_preset` | string | `host-simulator` | `start` 和 `test` 使用的 CMake configure/build preset |
-| `cross_preset` | string | `cm0-cross` | `pack` 使用的 CMake configure/build preset |
+| `backend` | string | `cmake` | `cmake` 或 `script`；决定 `test` 和 `pack` 的工作流 |
+| `host_preset` | string | `host-simulator` | `start` 和 CMake `test` 使用的 configure/build preset |
+| `cross_preset` | string | `cm0-cross` | CMake `pack` 使用的 configure/build preset |
+| `test_command` | string array | 无 | 脚本后端的测试命令，必须包含独立参数 `{report}` |
+| `pack_command` | string array | 无 | 脚本后端的打包命令，必须包含独立参数 `{output}` |
 | `package_dir` | string | `dist` | `pack` 的默认输出目录，以及 `deploy` 和 `publish` 的默认包搜索目录 |
 
 覆盖关系：
@@ -273,6 +317,42 @@ LILYGO_UI_CATEGORIES
 - `lpm pack --preset` 覆盖 `cross_preset`。
 - `lpm pack --output` 覆盖 `package_dir`，但不会永久修改配置。
 - `lpm deploy` 或 `lpm publish` 未显式指定包时，会递归选择 `package_dir` 下修改时间最新的 `.deb`。
+
+### 脚本命令约定
+
+命令为非空字符串参数数组，在项目根目录直接启动进程，不经过 shell。可以把解释器或可执行文件及其参数分开填写；不要把完整命令行写成一个字符串。支持的占位符必须独占一个参数：
+
+| 占位符 | 可用命令 | 替换值 |
+| --- | --- | --- |
+| `{python}` | `test_command`、`pack_command` | 当前运行 LPM 的 Python 解释器 |
+| `{report}` | `test_command`，必需 | 本次测试报告的绝对路径 |
+| `{output}` | `pack_command`，必需 | 本次打包输出目录的绝对路径 |
+
+例如使用 `["--report", "{report}"]`，不要使用 `"--report={report}"`。不会展开 shell 变量、通配符、`~`、管道或重定向；复杂步骤应写在仓库自己的脚本里。
+
+`test_command` 必须运行测试并为本次运行写入有效的 JUnit XML 报告。LPM 不生成脚本测试结果，也不会用旧报告判定成功。`pack_command` 必须在输出目录内生成或更新至少一个 `.deb`，未变化的旧包不计入结果。脚本返回非零状态、测试报告缺失或无效、报告含失败或错误、打包无新产物都会使命令失败。
+
+`start` 只支持 CMake 应用。脚本后端不接受 `test --preset` 或 `pack --preset`；改用脚本自身的配置管理工具链和构建选项。`--report`、`--output` 和 `[build].package_dir` 的路径及优先级规则不变。
+
+## `[run]`
+
+`[run]` 只影响本地 `lpm start`，不会进入应用发布清单。它可以在启动主机模拟器前准备外部服务，例如启动开发用的 Mihomo 容器：
+
+```toml
+[run]
+prepare_command = ["{python}", "tools/prepare-dev-environment.py"]
+
+[run.environment]
+CLASH_DEMO = "0"
+CLASH_API_URL = "http://127.0.0.1:19090"
+CLASH_API_SECRET = "lilygo-local-dev"
+CLASH_CONFIG_PATH = "{project}/.cache/mihomo-dev/config.yaml"
+CLASH_CONTROLLER_CONFIG_PATH = "/root/.config/mihomo/config.yaml"
+```
+
+`prepare_command` 必须是非空字符串参数数组。LPM 在构建完成后、启动模拟器前直接执行它，不经过 shell；准备命令返回非零时，模拟器不会启动。`{python}` 替换为运行 LPM 的 Python 解释器，`{project}` 替换为项目根目录绝对路径。占位符必须作为独立参数使用。
+
+`environment` 中的字符串会同时传给准备命令和模拟器。值中的 `{python}` 和 `{project}` 会展开；当前 shell 已存在的同名变量优先于项目配置，因此可以临时覆盖本地默认值。`lpm stop` 只停止模拟器进程，不会停止准备命令启动的外部服务。
 
 ## `[deploy]`
 
@@ -296,9 +376,9 @@ lpm deploy --target cm0-lab --user root --port 2222 --no-sudo
 - `--host`、`--user`、`--port` 的优先级高于 `[deploy]`。
 - `--host` 和 `--target` 互斥。
 - 使用 `--target` 时，默认不继承 `[deploy].user` 和 `[deploy].port`，用户与端口交给 SSH config；命令行显式值仍然优先。
-- `--no-sudo` 使远端直接执行 `dpkg --install`；默认通过 `sudo` 安装。
+- `--no-sudo` 使远端直接执行 `apt-get install --reinstall --yes`；默认通过 `sudo` 安装。相同版本也会重新安装。
 
-LPM 不读取或保存密码、私钥内容。认证由系统 `ssh`、`scp`、SSH agent 和 SSH config 完成。
+LPM 不读取或保存密码、私钥内容。认证由系统 `ssh`、`scp`、SSH agent 和 SSH config 完成。部署应用与运行库时均使用 SCP 和 `apt-get install --reinstall --yes` 安装本地 `.deb`，即使目标机已安装相同版本也会重新安装，并由目标机 APT 从已配置的软件源解析缺失依赖；LPM 不会运行 `apt-get update`、设置 Meshtasticd 运行库路径或重启服务，这些操作由设备或镜像配置负责。
 
 ### 项目级 SSH config
 
@@ -348,17 +428,21 @@ LPM_GITHUB_CLIENT_ID="<oauth-app-client-id>" lpm login
 GH_TOKEN="$LPM_PUBLISH_TOKEN" lpm publish dist/application.deb
 ```
 
-登录时 LPM 请求 `public_repo` 权限，在终端显示一次性验证码并打开 GitHub 验证页面。
+登录时 LPM 请求 `public_repo` 和 `workflow` 权限，在终端显示一次性验证码并打开
+GitHub 验证页面。`workflow` 用于同步用户 `packages` Fork 中的
+`.github/workflows` 文件；如果旧 Token 没有该权限，需要重新运行 `lpm login`。
 授权成功后，凭证目录权限为 `0700`，凭证文件权限为 `0600`；再次登录会原子替换旧
 Token。不要提交、共享或手工编辑该文件。
 
 发布 Token 代表的 GitHub 用户将成为首次发布应用的 owner，并需要创建或写入该用户
 的公开 `packages` Fork，以及向 `LILYGO-UI/packages` 创建 Pull Request。第三方仓库
 GitHub Actions 自动提供的 `GITHUB_TOKEN` 通常只对当前源码仓库有效，不能完成这些
-跨仓库操作；应改用具备相应公开仓库权限的用户 PAT，并通过 Secret 注入
+跨仓库操作；应改用具备相应公开仓库权限和 `workflow` 权限的用户 PAT，并通过 Secret 注入
 `GH_TOKEN`。Token 不应写入 `lpm.toml`、生成的 publish JSON、日志或版本库。
 
 ## 命令与配置依赖
+
+下表描述默认 CMake 应用和旧项目；运行库与脚本后端的要求见上文。
 
 | 命令 | 使用的配置 | 缺少 `[project]` 时的行为 |
 | --- | --- | --- |
@@ -370,8 +454,8 @@ GitHub Actions 自动提供的 `GITHUB_TOKEN` 通常只对当前源码仓库有�
 | `lpm pack` | `build.cross_preset`、`build.package_dir` | 当前模板会在 CMake 配置阶段失败，因为 CMake/CPack 需要项目元数据 |
 | `lpm deploy` | `build.package_dir`、`[deploy]` | 不直接依赖 `[project]` |
 | `lpm login` | 不读取 `lpm.toml`；使用 `LPM_GITHUB_CLIENT_ID` | 不读取项目，可在任意目录执行 |
-| `lpm publish` | `schema_version`、完整 `[project]`、`build.package_dir`（未指定包时） | 失败；无法校验发布清单和 Debian 包身份 |
-| `lpm unpublish` | `schema_version`、完整 `[project]`（使用 `package` 和 `app_id` 确认身份） | 失败；无法确认 Registry 应用身份；命令行 `VERSION` 可与 `project.version` 不同 |
+| `lpm publish` | `schema_version`、有效 `[project]`、`build.package_dir`（未指定包时） | 失败；无法确认项目包名或 Debian 包身份 |
+| `lpm unpublish` | `schema_version`、有效 `[project]`（应用使用 `app_id`，运行库使用 `package`） | 失败；无法确认 Registry 身份；命令行 `VERSION` 可与 `project.version` 不同 |
 
 因此，当前模板项目不能删除 `[project]`。它不仅服务于未来发布，还负责构建期的应用身份、安装元数据和包信息。
 

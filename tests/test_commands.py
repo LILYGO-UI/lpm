@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,7 +23,7 @@ from lpm.commands import (
     test,
 )
 from lpm.config import Project, load_toml, render_config
-from lpm.errors import LpmError
+from lpm.errors import CommandError, LpmError
 from lpm.metadata import build_publish_manifest
 
 
@@ -195,6 +197,76 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(state["pid"], 1234)
         self.assertEqual(log_path, self.root / ".lpm" / "simulator.log")
 
+    @patch("lpm.commands.run")
+    @patch("lpm.commands.resolve_executable")
+    @patch("lpm.commands.configure_and_build")
+    def test_start_runs_preparation_and_passes_environment_to_foreground_ui(
+        self, build: Mock, resolve: Mock, run_mock: Mock
+    ) -> None:
+        binary = self.root / "demo"
+        resolve.return_value = binary
+        run_mock.side_effect = [Mock(returncode=0), Mock(returncode=0)]
+        self.project.data["run"] = {
+            "prepare_command": ["{python}", "tools/prepare.py", "{project}"],
+            "environment": {"LPM_TEST_DEFAULT": "configured", "LPM_TEST_SHELL": "configured"},
+        }
+        with patch.dict(os.environ, {"LPM_TEST_SHELL": "shell"}, clear=False):
+            result = start(self.project, foreground=True, arguments=["--orientation", "landscape"])
+        self.assertEqual(result, 0)
+        build.assert_called_once_with(self.project, "host-simulator")
+        self.assertEqual(run_mock.call_count, 2)
+        prepare_command = run_mock.call_args_list[0].args[0]
+        self.assertEqual(prepare_command[0], sys.executable)
+        self.assertEqual(prepare_command[1:], ["tools/prepare.py", str(self.root.resolve())])
+        self.assertEqual(run_mock.call_args_list[0].kwargs["env"]["LPM_TEST_DEFAULT"], "configured")
+        self.assertEqual(run_mock.call_args_list[0].kwargs["env"]["LPM_TEST_SHELL"], "shell")
+        self.assertEqual(run_mock.call_args_list[1].args[0], [str(binary), "--orientation", "landscape"])
+        self.assertIs(run_mock.call_args_list[0].kwargs["env"], run_mock.call_args_list[1].kwargs["env"])
+
+    @patch("lpm.commands.time.sleep")
+    @patch("lpm.commands.spawn")
+    @patch("lpm.commands.resolve_executable")
+    @patch("lpm.commands.configure_and_build")
+    @patch("lpm.commands.run")
+    def test_start_runs_preparation_before_background_ui_with_environment(
+        self, run_mock: Mock, build: Mock, resolve: Mock, spawn_mock: Mock, sleep: Mock
+    ) -> None:
+        binary = self.root / "demo"
+        resolve.return_value = binary
+        process = Mock(pid=1235)
+        process.poll.return_value = None
+        spawn_mock.return_value = process
+        self.project.data["run"] = {
+            "prepare_command": ["prepare", "{project}"],
+            "environment": {
+                "LPM_TEST_DEFAULT": "configured",
+                "LPM_TEST_PROJECT": "{project}/.cache",
+            },
+        }
+        start(self.project)
+        build.assert_called_once_with(self.project, "host-simulator")
+        run_mock.assert_called_once_with(
+            ["prepare", str(self.root.resolve())],
+            cwd=self.root,
+            env=spawn_mock.call_args.kwargs["env"],
+        )
+        spawn_mock.assert_called_once()
+        self.assertEqual(spawn_mock.call_args.args[0], [str(binary)])
+        self.assertEqual(spawn_mock.call_args.kwargs["env"]["LPM_TEST_DEFAULT"], "configured")
+        self.assertEqual(spawn_mock.call_args.kwargs["env"]["LPM_TEST_PROJECT"], f"{self.root.resolve()}/.cache")
+
+    @patch("lpm.commands.resolve_executable")
+    @patch("lpm.commands.configure_and_build")
+    def test_start_does_not_launch_ui_when_preparation_fails(
+        self, build: Mock, resolve: Mock
+    ) -> None:
+        self.project.data["run"] = {"prepare_command": ["prepare"]}
+        with patch("lpm.commands.run", side_effect=CommandError(["prepare"], 7)) as run_mock:
+            with self.assertRaises(CommandError):
+                start(self.project)
+        run_mock.assert_called_once_with(["prepare"], cwd=self.root)
+        resolve.assert_called_once()
+
     @patch("lpm.commands.time.sleep")
     @patch("lpm.commands.spawn")
     @patch("lpm.commands.resolve_executable")
@@ -294,8 +366,21 @@ class WorkflowTests(unittest.TestCase):
             ),
         )
         remote_command = run_mock.call_args_list[1].args[0][-1]
-        self.assertIn(f"sudo -- dpkg --install {remote_path}", remote_command)
+        self.assertIn(f"sudo -- apt-get install --reinstall --yes {remote_path}", remote_command)
         self.assertIn(f"rm -f -- {remote_path}", remote_command)
+
+    @patch("lpm.commands.require_tool")
+    @patch("lpm.commands.run")
+    def test_deploy_no_sudo_does_not_allocate_tty(self, run_mock: Mock, tool: Mock) -> None:
+        package = self.root / "dist" / "demo.deb"
+        package.parent.mkdir()
+        package.touch()
+
+        deploy(self.project, package=package, sudo=False)
+
+        ssh_command = run_mock.call_args_list[1].args[0]
+        self.assertNotIn("-tt", ssh_command)
+        self.assertIn("apt-get install --reinstall --yes", ssh_command[-1])
 
     @patch("lpm.commands.require_tool")
     @patch("lpm.commands.run")
@@ -313,8 +398,8 @@ class WorkflowTests(unittest.TestCase):
             ["scp", "-P", "22", package.resolve(), f"pi@raspberrypi.local:{remote_path}"],
         )
         self.assertEqual(
-            run_mock.call_args_list[1].args[0][0:4],
-            ["ssh", "-p", "22", "pi@raspberrypi.local"],
+            run_mock.call_args_list[1].args[0][0:5],
+            ["ssh", "-p", "22", "-tt", "pi@raspberrypi.local"],
         )
 
     @patch("lpm.commands.require_tool")
@@ -341,7 +426,10 @@ class WorkflowTests(unittest.TestCase):
                 cwd=self.root,
             ),
         )
-        self.assertEqual(run_mock.call_args_list[1].args[0][:4], ["ssh", "-F", ssh_config, "cm0-lab"])
+        self.assertEqual(
+            run_mock.call_args_list[1].args[0][:5],
+            ["ssh", "-F", ssh_config, "-tt", "cm0-lab"],
+        )
 
     @patch("lpm.commands.require_tool")
     @patch("lpm.commands.run")
@@ -353,7 +441,10 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertEqual(run_mock.call_args_list[0].args[0][0:4], ["scp", "-P", "2200", package.resolve()])
         self.assertIn("admin@cm0-lab:", run_mock.call_args_list[0].args[0][-1])
-        self.assertEqual(run_mock.call_args_list[1].args[0][0:4], ["ssh", "-p", "2200", "admin@cm0-lab"])
+        self.assertEqual(
+            run_mock.call_args_list[1].args[0][0:5],
+            ["ssh", "-p", "2200", "-tt", "admin@cm0-lab"],
+        )
 
     def test_deploy_rejects_option_injection(self) -> None:
         with self.assertRaisesRegex(LpmError, "deploy host"):

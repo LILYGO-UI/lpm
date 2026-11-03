@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -40,6 +41,7 @@ from .process import (
     spawn,
     stop_process_group,
 )
+from .script_workflow import pack_script, test_script
 
 DEFAULT_TEMPLATE = "https://github.com/LILYGO-UI/template.git"
 _COPY_IGNORE = shutil.ignore_patterns(".git", "build", "dist", ".cache", ".lpm")
@@ -154,13 +156,22 @@ def start(
     foreground: bool = False,
     arguments: list[str] | None = None,
 ) -> Path | int:
+    project.require_application("start")
+    if project.build_backend != "cmake":
+        raise LpmError("lpm start requires the cmake build backend")
     preset = preset or str(project.get("build", "host_preset", "host-simulator"))
+    prepare_command = project.run_prepare_command()
+    configured_environment = project.run_environment()
+    runtime_environment = _runtime_environment(project, configured_environment)
     if build:
         configure_and_build(project, preset)
     binary = resolve_executable(project, preset=preset, executable=executable)
     command = [str(binary), *(arguments or [])]
     if foreground:
-        return run(command, cwd=project.root).returncode
+        _run_prepare(project, prepare_command, runtime_environment)
+        if runtime_environment is None:
+            return run(command, cwd=project.root).returncode
+        return run(command, cwd=project.root, env=runtime_environment).returncode
 
     project.state_dir.mkdir(parents=True, exist_ok=True)
     pid_path = project.state_dir / "simulator.json"
@@ -179,9 +190,13 @@ def start(
             raise LpmError(f"simulator is already running with PID {old_pid}")
         pid_path.unlink(missing_ok=True)
 
+    _run_prepare(project, prepare_command, runtime_environment)
     log_path = project.state_dir / "simulator.log"
     with log_path.open("ab") as log:
-        process = spawn(command, cwd=project.root, log=log)
+        if runtime_environment is None:
+            process = spawn(command, cwd=project.root, log=log)
+        else:
+            process = spawn(command, cwd=project.root, log=log, env=runtime_environment)
     time.sleep(0.1)
     if process.poll() is not None:
         raise LpmError(f"simulator exited immediately; inspect {log_path}")
@@ -193,6 +208,53 @@ def start(
     }
     pid_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
     return log_path
+
+
+def _run_prepare(
+    project: Project,
+    command: list[str] | None,
+    environment: dict[str, str] | None,
+) -> None:
+    if not command:
+        return
+    expanded = _expand_prepare_command(project, command)
+    if environment is None:
+        run(expanded, cwd=project.root)
+    else:
+        run(expanded, cwd=project.root, env=environment)
+
+
+def _runtime_environment(project: Project, configured: dict[str, str]) -> dict[str, str] | None:
+    """Merge project defaults with the invoking shell environment.
+
+    Returning ``None`` when no project values are configured preserves the
+    inherited environment and avoids changing the subprocess call shape for
+    legacy projects.  Explicit shell values always win over project defaults.
+    """
+    if not configured:
+        return None
+    environment = os.environ.copy()
+    substitutions = {
+        "{python}": sys.executable,
+        "{project}": str(project.root.resolve()),
+    }
+    for key, value in configured.items():
+        if key not in environment:
+            expanded = value
+            for placeholder, replacement in substitutions.items():
+                expanded = expanded.replace(placeholder, replacement)
+            environment[key] = expanded
+    return environment
+
+
+def _expand_prepare_command(project: Project, command: list[str]) -> list[str]:
+    substitutions = {
+        "{python}": sys.executable,
+        "{project}": str(project.root.resolve()),
+    }
+    # Placeholder expansion is argument based; embedded text remains a
+    # literal so the command never gains shell-like interpolation semantics.
+    return [substitutions.get(argument, argument) for argument in command]
 
 
 def resolve_executable(project: Project, *, preset: str, executable: str | None) -> Path:
@@ -240,6 +302,7 @@ def _read_state(path: Path) -> dict[str, object] | None:
 
 
 def stop(project: Project, *, timeout: float = 5.0) -> bool:
+    project.require_application("stop")
     pid_path = project.state_dir / "simulator.json"
     state = _read_state(pid_path)
     if not state:
@@ -262,6 +325,8 @@ def stop(project: Project, *, timeout: float = 5.0) -> bool:
 
 
 def test(project: Project, *, preset: str | None = None, report: Path | None = None) -> Path:
+    if project.build_backend == "script":
+        return test_script(project, preset=preset, report=report)
     preset = preset or str(project.get("build", "host_preset", "host-simulator"))
     configure_and_build(project, preset)
     require_tool("ctest")
@@ -275,6 +340,8 @@ def test(project: Project, *, preset: str | None = None, report: Path | None = N
 
 
 def pack(project: Project, *, preset: str | None = None, output: Path | None = None) -> list[Path]:
+    if project.build_backend == "script":
+        return pack_script(project, preset=preset, output=output)
     preset = preset or str(project.get("build", "cross_preset", "cm0-cross"))
     configure_and_build(project, preset)
     require_tool("cpack")
@@ -308,6 +375,7 @@ def deploy(
     port: int | None = None,
     sudo: bool = True,
 ) -> Path:
+    project.build_backend
     if target is not None:
         host = target
         user = user if user is not None else ""
@@ -338,8 +406,16 @@ def deploy(
     if port is not None:
         scp_options.extend(["-P", str(port)])
         ssh_options.extend(["-p", str(port)])
+    if sudo:
+        # sudo prompts for a password through the remote terminal.  An SSH
+        # command does not allocate one by default, so force a pty for the
+        # interactive install while keeping --no-sudo suitable for pipes and
+        # other non-interactive callers.
+        ssh_options.append("-tt")
     run(["scp", *scp_options, package, f"{destination}:{remote_path}"], cwd=project.root)
-    install = ["dpkg", "--install", remote_path]
+    # Install the local package through APT so dependencies can be resolved
+    # from the target's configured repositories.
+    install = ["apt-get", "install", "--reinstall", "--yes", remote_path]
     if sudo:
         install = ["sudo", "--", *install]
     remote_command = "set -e; " + shlex.join(install) + "; " + shlex.join(
@@ -351,7 +427,10 @@ def deploy(
 
 def _latest_package(project: Project) -> Path:
     output = project.root / str(project.get("build", "package_dir", "dist"))
-    packages = [path for path in output.rglob("*.deb") if path.is_file()]
+    packages = [
+        path for path in output.rglob("*.deb")
+        if path.is_file() and "_CPack_Packages" not in path.relative_to(output).parts
+    ]
     if not packages:
         raise LpmError(f"no Debian package found under {output}; run lpm pack first")
     return max(packages, key=lambda path: path.stat().st_mtime).resolve()

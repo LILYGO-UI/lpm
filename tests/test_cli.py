@@ -112,6 +112,45 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             publish_mock.call_args.kwargs["package_path"], Path("dist/demo.deb")
         )
+        self.assertFalse(publish_mock.call_args.kwargs["force"])
+
+    @patch("lpm.cli.find_project")
+    @patch("lpm.cli.publish")
+    def test_publish_force_forwards_replacement_option(
+        self, publish_mock, project_mock
+    ) -> None:
+        publish_mock.return_value = Submission(
+            "https://github.com/LILYGO-UI/packages/pull/42",
+            "lilygo-ui-demo",
+            "1.2.3",
+        )
+        for arguments, package_path in (
+            (["publish", "--force"], None),
+            (["publish", "--force", "dist/new.deb"], Path("dist/new.deb")),
+        ):
+            with self.subTest(arguments=arguments), redirect_stdout(io.StringIO()):
+                self.assertEqual(main(arguments), 0)
+                publish_mock.assert_called_with(
+                    project_mock.return_value, package_path=package_path, force=True
+                )
+
+    @patch("lpm.cli.find_project")
+    @patch("lpm.cli.publish")
+    def test_publish_runtime_forwards_runtime_option(self, publish_mock, project_mock) -> None:
+        publish_mock.return_value = Submission(
+            "https://github.com/LILYGO-UI/packages/pull/44",
+            "meshtasticd",
+            "2.8.0.0~local4528018+lr2021cad1",
+        )
+        with redirect_stdout(io.StringIO()):
+            code = main(["publish", "--runtime", "dist/meshtasticd.deb"])
+        self.assertEqual(code, 0)
+        publish_mock.assert_called_once_with(
+            project_mock.return_value,
+            package_path=Path("dist/meshtasticd.deb"),
+            force=False,
+            runtime=True,
+        )
 
     @patch("lpm.cli.find_project")
     @patch("lpm.cli.unpublish")

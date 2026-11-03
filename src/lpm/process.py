@@ -10,7 +10,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import IO, Sequence
+from typing import IO, Mapping, Sequence
 
 from .errors import CommandError, LpmError
 
@@ -27,6 +27,7 @@ def run(
     *,
     cwd: Path,
     capture: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     argv = [str(item) for item in command]
     try:
@@ -37,6 +38,7 @@ def run(
             text=True,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
+            env=dict(env) if env is not None else None,
         )
     except OSError as exc:
         raise LpmError(f"cannot run {argv[0]}: {exc}") from exc
@@ -49,7 +51,13 @@ def run(
     return result
 
 
-def spawn(command: Sequence[str | Path], *, cwd: Path, log: IO[bytes]) -> subprocess.Popen[bytes]:
+def spawn(
+    command: Sequence[str | Path],
+    *,
+    cwd: Path,
+    log: IO[bytes],
+    env: Mapping[str, str] | None = None,
+) -> subprocess.Popen[bytes]:
     argv = [str(item) for item in command]
     try:
         return subprocess.Popen(
@@ -59,6 +67,7 @@ def spawn(command: Sequence[str | Path], *, cwd: Path, log: IO[bytes]) -> subpro
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=dict(env) if env is not None else None,
         )
     except OSError as exc:
         raise LpmError(f"cannot start {argv[0]}: {exc}") from exc

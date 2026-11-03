@@ -23,7 +23,10 @@ from .errors import LpmError
 
 GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
 GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
-GITHUB_OAUTH_SCOPE = "public_repo"
+# Publishing synchronizes the user's packages fork with the central repository.
+# GitHub requires the workflow scope when that sync includes files under
+# .github/workflows, even though the fork itself is public.
+GITHUB_OAUTH_SCOPE = "public_repo workflow"
 GITHUB_CLIENT_ID_ENV = "LPM_GITHUB_CLIENT_ID"
 DEFAULT_GITHUB_CLIENT_ID = "Ov23li2je0k6yeO2cisv"
 
@@ -234,11 +237,11 @@ class GitHubClient:
             if exc.code in expected:
                 status = exc.code
             else:
-                raise self._http_error(exc.code, body) from exc
+                raise self._http_error(exc.code, body, method=method, url=url) from exc
         except (OSError, URLError) as exc:
             raise LpmError(f"GitHub request failed: {exc}") from exc
         if status not in expected:
-            raise self._http_error(status, body)
+            raise self._http_error(status, body, method=method, url=url)
         if not body:
             return None
         try:
@@ -247,7 +250,13 @@ class GitHubClient:
             raise LpmError("GitHub returned an invalid JSON response") from exc
 
     @staticmethod
-    def _http_error(status: int, body: bytes) -> LpmError:
+    def _http_error(
+        status: int,
+        body: bytes,
+        *,
+        method: str | None = None,
+        url: str | None = None,
+    ) -> LpmError:
         detail = ""
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -256,7 +265,10 @@ class GitHubClient:
         except (UnicodeDecodeError, json.JSONDecodeError):
             pass
         suffix = f": {detail}" if detail else ""
-        return LpmError(f"GitHub API request failed with HTTP {status}{suffix}")
+        request = f" ({method} {url})" if method and url else ""
+        return LpmError(
+            f"GitHub API request failed with HTTP {status}{suffix}{request}"
+        )
 
     def current_user(self) -> str:
         payload = self.request("GET", "/user")
@@ -297,6 +309,16 @@ class GitHubClient:
                 return fork_name
             time.sleep(1)
         raise LpmError(f"timed out waiting for GitHub to create fork {fork_name}")
+
+    def sync_fork(self, repository: str, *, branch: str) -> None:
+        """Fast-forward a fork branch to its upstream branch before writing."""
+        encoded_repo = "/".join(quote(part, safe="") for part in repository.split("/"))
+        self.request(
+            "POST",
+            f"/repos/{encoded_repo}/merge-upstream",
+            {"branch": branch},
+            expected=(200,),
+        )
 
     def branch_base(self, repository: str) -> tuple[str, str, str]:
         repo = self.repository(repository)
@@ -478,7 +500,12 @@ class GitHubClient:
             response = connection.getresponse()
             body = response.read()
             if response.status != 201:
-                raise self._http_error(response.status, body)
+                raise self._http_error(
+                    response.status,
+                    body,
+                    method="POST",
+                    url=url,
+                )
             payload = json.loads(body.decode("utf-8"))
         except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
             if isinstance(exc, LpmError):

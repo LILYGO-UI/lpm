@@ -2,16 +2,16 @@
 
 [English](README.md) | 简体中文
 
-`lpm` 是 LILYGO UI 的标准项目管理 CLI。它用 Python 3 开发，统一接管应用模板初始化、CMake 主机仿真、测试、AArch64 交叉编译、Debian 打包和 SSH 部署。
+`lpm` 是 LILYGO UI 的标准项目管理 CLI。它用 Python 3 开发，统一接管应用模板初始化、CMake 主机仿真、测试、AArch64 交叉编译、Debian 打包和 SSH 部署。运行库可通过脚本后端调用自身的构建和打包工具。
 
 ## 环境要求
 
 - Python 3.11 或更高版本
-- CMake 3.21 或更高版本（包含 `ctest`、`cpack`）
+- 默认 CMake 后端需要 CMake 3.21 或更高版本（包含 `ctest`、`cpack`）
 - Git（从 GitHub 直接安装或从远程模板初始化项目时需要）
 - `dpkg-deb`（发布时需要）
 - SSH 与 SCP（部署时需要）
-- LILYGO UI 模板要求的编译器、SDL2 和交叉编译环境
+- LILYGO UI 模板要求的编译器、SDL2 和交叉编译环境，或脚本项目自身要求的工具
 
 ## 安装
 
@@ -71,7 +71,7 @@ lpm init weather-station \
 
 ### `lpm start`
 
-配置并构建 `host-simulator` preset，然后在后台启动模拟器：
+配置并构建 `host-simulator` preset，执行可选的项目准备命令，然后在后台启动模拟器：
 
 ```sh
 lpm start
@@ -79,6 +79,20 @@ lpm start --no-build -- --fullscreen
 ```
 
 运行状态保存在 `.lpm/simulator.json`，日志写入 `.lpm/simulator.log`。使用 `--foreground` 可让模拟器保持在当前终端。`--preset` 和 `--executable` 可覆盖配置。
+
+项目可以在 UI 启动前准备真实的本地依赖：
+
+```toml
+[run]
+prepare_command = ["{python}", "tools/prepare-dev-environment.py"]
+
+[run.environment]
+CLASH_DEMO = "0"
+CLASH_API_URL = "http://127.0.0.1:19090"
+CLASH_CONFIG_PATH = "{project}/.cache/mihomo-dev/config.yaml"
+```
+
+LPM 会在构建完成后、前台或后台启动模拟器前执行 `prepare_command`。命令数组不经过 shell；`{python}` 和 `{project}` 是支持的占位符。配置的环境变量会同时传给准备命令和 UI，当前 shell 中已有的同名变量优先。`lpm stop` 只停止 UI，不停止准备命令启动的外部服务。
 
 ### `lpm stop`
 
@@ -98,7 +112,7 @@ lpm test
 lpm test --report build/test-results.xml
 ```
 
-默认报告位置为 `.lpm/test-results.xml`。
+默认报告位置为 `.lpm/test-results.xml`。设置 `build.backend = "script"` 时，LPM 调用 `build.test_command`，脚本必须在 `{report}` 位置写入本次运行的 JUnit XML 报告。`--preset` 仅适用于 CMake 后端。
 
 ### `lpm pack`
 
@@ -109,7 +123,7 @@ lpm pack
 lpm pack --output dist
 ```
 
-默认产物目录为 `dist/`。命令结束时会列出本次生成的所有 `.deb` 文件。
+默认产物目录为 `dist/`。命令结束时会列出本次生成的所有 `.deb` 文件。设置 `build.backend = "script"` 时，LPM 调用 `build.pack_command`，将 `{output}` 替换为输出目录的绝对路径。必须生成或更新至少一个 `.deb`；未变化的已有包不计入本次产物。`--preset` 仅适用于 CMake 后端。
 
 ### `lpm metadata`
 
@@ -120,11 +134,11 @@ lpm metadata --format cmake
 lpm metadata --format publish-json --output publish.json
 ```
 
-CMake 格式由应用模板在配置阶段使用。JSON 格式符合 registry 的发布 schema，也是 `lpm publish` 实际使用的同一份已校验清单；它是生成产物，不应提交或手工编辑，其中永远不会包含构建 preset 和部署主机等信息。
+CMake 格式由应用模板在配置阶段使用；运行库项目只输出运行库身份变量。应用项目的 JSON 格式符合 registry 发布 schema，也是 `lpm publish` 使用的已校验清单；运行库项目输出本地身份快照，因为版本、架构、大小和摘要会在 `lpm publish` 时从 `.deb` 读取。它是生成产物，不应提交或手工编辑，其中永远不会包含构建 preset 和部署主机等信息。
 
 ### `lpm deploy`
 
-通过 SCP 上传 Debian 包，并经 SSH 执行 `sudo dpkg --install`：
+通过 SCP 上传 Debian 包，并经 SSH 执行 `sudo apt-get install --reinstall`：
 
 ```sh
 lpm deploy --host cm0.local --user pi
@@ -132,7 +146,7 @@ lpm deploy dist/lilygo-ui-weather-station_0.1.0_arm64.deb --host 192.168.1.42
 lpm deploy --target cm0-lab
 ```
 
-未指定包时使用 `dist/` 下最新的 `.deb`。SSH 使用系统现有的密钥、agent 和 `~/.ssh/config`，LPM 不保存密码。目标用户已经是 root 时可加 `--no-sudo`。安装成功后，上传到目标机 `/tmp` 的文件会被删除。
+未指定包时使用 `dist/` 下最新的 `.deb`。SSH 使用系统现有的密钥、agent 和 `~/.ssh/config`，LPM 不保存密码。目标用户已经是 root 时可加 `--no-sudo`。APT 会强制重新安装上传的包，即使目标机已安装相同版本，并从已配置的软件源解析缺失依赖；LPM 不会更新软件包索引，也不会启用私有图形驱动。安装成功后，上传到目标机 `/tmp` 的文件会被删除。运行库也使用同一部署流程；服务配置仍由设备或镜像负责。
 
 需要在同一项目中切换多块目标板时，可将标准 OpenSSH 配置写入 `.lpm/ssh_config`：
 
@@ -158,22 +172,44 @@ Host cm0-test
 lpm login
 lpm publish
 lpm publish dist/lilygo-ui-weather-station_1.0.0_arm64.deb
+lpm publish --runtime dist/meshtasticd_2.8.0.0~local4528018+lr2021cad1_arm64.deb
 lpm unpublish 1.0.0 --reason "Critical startup failure"
+# 下架 PR 合并后，使用重新构建的包替换该版本：
+lpm publish --force dist/lilygo-ui-weather-station_1.0.0_arm64.deb
 ```
 
 发布过程完全依赖 GitHub，不需要独立 Registry API。LPM 会在本地校验清单和
 Debian control 字段，创建或复用当前 GitHub 用户的公开 `packages` Fork，将
 `.deb` 上传到 Fork 的公开 prerelease，提交内容寻址的图片与版本记录，最后向
 `LILYGO-UI/packages` 创建 Pull Request。中央仓库在无 Secret 的 PR 工作流中校验
-提交；审核合并后，受信任工作流把 `.deb` 转存到中央 Release，并部署新的 GitHub
+提交；如果用户的 `packages` Fork 落后于中央仓库，LPM 会先快进同步其默认分支。审核合并后，受信任工作流把 `.deb` 转存到中央 Release，并部署新的 GitHub
 Pages 快照。
+
+`project.compatibility.architectures` 必须恰好声明一个架构，例如 `["arm64"]`、
+`["amd64"]`、`["armhf"]` 或 `["all"]`。LPM 保留该值，并要求 DEB 的
+`Architecture` 与它精确一致；拒绝架构通配符和 `source`。
+每个包版本仍只对应一个 DEB，不能用另一架构替换已存在的版本。
+发布新架构前，需要先将对应的 `packages` schema 更新合并到默认分支。
+完整规则见[配置文档](docs/configuration.md)。
+
+`publish --runtime` 会读取 DEB control 中的包名、版本和架构，把类似 `meshtasticd`
+的运行库提交到 `runtimes/<package>/`；它可以从应用源码仓库执行，因为运行库身份
+由 DEB 本身确定。
+
+`publish --force` 允许用新包替换已下架版本，应用的包名、版本号、应用 ID 和架构必须
+保持一致。下架 PR 必须先合并；不能替换仍为 `published` 或已 `revoked` 的版本。
+该命令提交新的审核 PR，更新清单与包哈希，合并和转存后恢复上架；旧的内容寻址
+DEB 和 Git 历史仍保留。不加 `--force` 仍拒绝已存在的版本；版本尚不存在时，
+`--force` 按普通发布处理。提交替换前，必须先将对应的中央校验器更新合并到
+`packages/main`。只按版本号判断升级的客户端需要显式重新安装，才能使用同版本新包。
 
 由于中央工作流没有第三方 Fork 的私有凭证，暂存 prerelease 必须公开。
 `unpublish` 同样创建 Pull Request；它保留历史记录与 Debian 文件，只把选定版本
 改为 `yanked`。如需使用已有 Token，可设置 `GH_TOKEN`，否则 LPM 使用 `lpm login`
 保存的凭证。登录通过内置的 LILYGO OAuth App 执行 GitHub OAuth Device Flow，不依赖
-GitHub CLI；开发时可用 `LPM_GITHUB_CLIENT_ID` 覆盖其 Client ID。在第三方项目的
-GitHub Actions 中，应把具备公开仓库权限的用户 PAT
+GitHub CLI；由于发布需要同步用户 `packages` Fork 中的 workflow 文件，登录会请求
+`public_repo` 和 `workflow` 权限；开发时可用 `LPM_GITHUB_CLIENT_ID` 覆盖其 Client ID。在第三方项目的
+GitHub Actions 中，应把具备公开仓库权限和 `workflow` 权限的用户 PAT
 保存为仓库 Secret，并以 `GH_TOKEN` 注入；工作流自动获得的 `GITHUB_TOKEN` 只对
 应用源码仓库有效，不能写入用户的 `packages` Fork。
 
@@ -200,11 +236,39 @@ package_dir = "dist"
 host = "raspberrypi.local"
 user = "pi"
 port = 22
+
+# 可选的本地启动准备；不会进入发布元数据。
+[run]
+prepare_command = ["{python}", "tools/prepare-dev-environment.py"]
 ```
 
 `lpm.toml` 是开发者唯一需要维护的入口，统一保存应用身份、发布元数据、构建 preset 和部署默认值。CMake 从 `[project]` 派生 Launcher、desktop、AppStream 和 Debian 包元数据。直接执行 `lpm deploy` 时默认部署到 `pi@raspberrypi.local:22`，命令行参数优先于 `[deploy]`。
 
 当前模板项目不能删除 `[project]`：元数据生成和 CMake 配置都依赖它，`lpm start` 也用 `project.package` 推导默认模拟器可执行文件。没有 `lpm.toml` 的旧 CMake 工程仍可使用部分工作流命令；`--executable`、旧版 `project.executable` 和 `cmake/AppIdentity.cmake` 继续作为 `start` 的兼容回退。完整字段说明见 [配置参考](docs/configuration.md)。
+
+## 运行库与脚本工作流
+
+`meshtasticd` 等运行库可以通过以下配置调用仓库已有工具：
+
+```toml
+schema_version = 1
+
+[project]
+kind = "runtime"
+package = "meshtasticd"
+
+[build]
+backend = "script"
+package_dir = "dist"
+test_command = ["{python}", "tools/lpm-workflow.py", "test", "--report", "{report}"]
+pack_command = ["{python}", "tools/lpm-workflow.py", "pack", "--output-dir", "{output}"]
+```
+
+随后使用 `lpm test`、`lpm pack` 和 `lpm deploy --host <board> --user pi`。命令数组在项目根目录直接执行，不经过 shell。完整参数 `{python}` 替换为 LPM 使用的 Python 解释器，`{report}` 和 `{output}` 分别替换为测试报告和包输出目录的绝对路径；不会展开 shell 变量、通配符、管道或嵌入字符串的占位符。工作流适配脚本及其构建依赖由运行库仓库提供。
+
+`project.kind` 默认为 `"application"`，`build.backend` 默认为 `"cmake"`，现有应用配置保持原有行为。运行库的 `[project]` 只包含 `kind` 和 `package`，版本及 Debian 元数据由原生打包工具维护；应用身份和发布元数据仍以 `lpm.toml` 为唯一入口。
+
+运行库支持本地测试、打包、SSH 部署、metadata、registry 发布和下架。`start`、`stop` 会明确报告不支持。运行库的 `metadata --format publish-json` 输出本地身份快照；发布时再从生成的 Debian control 字段读取包名、版本和架构，并向 packages registry 提交 `runtimes/<package>/` 记录。脚本接口详见[配置参考](docs/configuration.md)。
 
 ## 开发与测试
 
@@ -213,4 +277,4 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 PYTHONPATH=src python3 -m lpm --help
 ```
 
-测试覆盖配置解析、模板初始化、CMake/CTest/CPack 工作流、后台进程安全、包选择、SSH 命令构造、registry 提交和 CLI 错误处理。
+测试覆盖配置解析、模板初始化、CMake/CTest/CPack 与脚本工作流、运行库命令边界、后台进程安全、包选择、SSH 命令构造、registry 提交和 CLI 错误处理。
