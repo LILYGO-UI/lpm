@@ -122,6 +122,20 @@ class Project:
     def state_dir(self) -> Path:
         return self.root / ".lpm"
 
+    def cross_presets(self) -> dict[str, str]:
+        presets = self.get("build", "cross_presets", {})
+        if not isinstance(presets, dict) or any(
+            not isinstance(arch, str)
+            or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", arch)
+            or arch == "source" or "any" in arch.split("-") or len(arch) > 64
+            or not isinstance(preset, str) or not preset or "\0" in preset
+            for arch, preset in presets.items()
+        ):
+            raise LpmError("build.cross_presets must map Debian architectures to CMake preset names")
+        if len(set(presets.values())) != len(presets):
+            raise LpmError("build.cross_presets must use a distinct preset for each architecture")
+        return dict(presets)
+
 
 def find_project(start: Path | None = None) -> Project:
     current = (start or Path.cwd()).resolve()
@@ -265,6 +279,10 @@ def render_config(data: dict[str, Any]) -> str:
             f'port = {int(deploy.get("port", DEFAULT_DEPLOY_PORT))}',
         ]
     )
+    if "cross_presets" in build:
+        lines.extend(["", "[build.cross_presets]"])
+        for arch, preset in Project(Path("."), data).cross_presets().items():
+            lines.append(f"{quote_toml(arch)} = {quote_toml(preset)}")
     if run is not None:
         if not isinstance(run, dict):
             raise LpmError("run must be a table")
@@ -337,6 +355,7 @@ def _render_runtime_config(data: dict[str, Any]) -> str:
             "package_dir",
             "test_command",
             "pack_command",
+            "cross_presets",
         }
         unknown_build = sorted(set(build) - allowed_build)
         if unknown_build:
@@ -360,6 +379,11 @@ def _render_runtime_config(data: dict[str, Any]) -> str:
             ):
                 raise LpmError(f"build.{key} must be an array of nonempty strings")
             lines.append(f"{key} = {_toml_string_array(command)}")
+
+    if isinstance(build, dict) and "cross_presets" in build:
+        lines.extend(["", "[build.cross_presets]"])
+        for arch, preset in Project(Path("."), data).cross_presets().items():
+            lines.append(f"{quote_toml(arch)} = {quote_toml(preset)}")
 
     deploy = data.get("deploy")
     if deploy is not None:

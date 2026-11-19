@@ -2,7 +2,7 @@
 
 English | [简体中文](README_CN.md)
 
-`lpm` is the standard project management CLI for LILYGO UI. Written in Python 3, it provides a single workflow for initializing applications from a template, running CMake host simulations and tests, cross-compiling for AArch64, creating Debian packages, and deploying over SSH. Runtime libraries can use their own build and packaging tools through the script backend.
+`lpm` is the standard project management CLI for LILYGO UI. Written in Python 3, it provides a single workflow for initializing applications from a template, running CMake host simulations and tests, cross-compiling for AArch64 and RISC-V 64, creating Debian packages, and deploying over SSH. Runtime libraries can use their own build and packaging tools through the script backend.
 
 ## Requirements
 
@@ -69,6 +69,37 @@ Initialization uses the official [LILYGO UI template](https://github.com/LILYGO-
 
 The common operations are summarized below. See [command business logic](docs/commands.md) for parameter precedence, internal execution flow, state files, and failure behavior.
 
+### `lpm set-target`
+
+Save a platform for the current project, then omit architecture flags:
+
+```sh
+lpm set-target cm0       # arm64
+lpm pack
+lpm deploy --host cm0.local
+
+lpm set-target k230      # riscv64
+lpm pack
+lpm deploy --host 192.168.8.151 --user wing
+
+lpm set-target all       # every architecture declared by the project
+lpm pack
+lpm publish
+```
+
+The selection is stored in `.lpm/target.json`, persists across terminals, and
+applies only to this project. `pack`, `metadata`, `deploy`, `publish`, and
+`unpublish` use it by default. Explicit `--arch`, `--all-architectures`,
+`pack --preset`, or package paths override it for that invocation.
+Without a saved target, the existing defaults apply.
+
+`all` enables batch packing/publication and full metadata; it does not mean
+Debian's architecture-independent `all` package type. Deployment and unpublishing
+require a single platform: switch to `cm0` or `k230`, or pass `--arch`.
+`deploy --target` still selects an SSH alias independently of the platform.
+Host simulator commands and tests keep their host presets; script-backend
+packing continues to use the project's script configuration.
+
 ### `lpm start`
 
 Configure and build the `host-simulator` preset, run the optional project preparation command, then start the simulator in the background:
@@ -116,12 +147,40 @@ The default report path is `.lpm/test-results.xml`. With `build.backend = "scrip
 
 ### `lpm pack`
 
-Configure and build the `cm0-cross` preset, then use `build/cm0-cross/CPackConfig.cmake` to generate Debian packages:
+Run `lpm set-target k230` once in the application repository, then `lpm pack`. Before configuring the application, LPM checks the cross compiler and Debian packaging tools, installs missing tools with Homebrew or APT, and initializes missing Git submodules. Installing host packages on Linux may require sudo. LPM downloads the pinned sysroot from the `LILYGO-UI/canaan-gen` release, checks its SHA-256, and keeps both the archive and extracted `sysroot/` in the project’s `.cache/k230-bsp/20261116T104343Z/`. It passes the prepared path to CMake. Subsequent packs reuse the cache offline. Set `LILYGO_UI_DEBIAN_SYSROOT` at pack time to use an existing sysroot.
+
+Build Debian packages for the saved target. Without a target or explicit selection,
+use `build.cross_preset` (default `cm0-cross`) and its CPack configuration:
 
 ```sh
 lpm pack
 lpm pack --output dist
+lpm pack --arch arm64
+lpm pack --arch riscv64
+lpm pack --all-architectures
 ```
+
+For a multi-architecture CMake project, configure:
+
+```toml
+[project.compatibility]
+architectures = ["arm64", "riscv64"]
+min_appkit_version = "0.1.0"
+
+[build.cross_presets]
+arm64 = "cm0-cross"
+riscv64 = "k230-debian"
+```
+
+Provide matching configure/build presets. With no saved target, `lpm pack` keeps
+the `cross_preset` default; `set-target all` or `--all-architectures` builds every
+declared architecture sequentially. Single-architecture projects can keep using
+`cross_preset` without adding a `cross_presets` mapping.
+Each invocation uses a separate temporary packaging directory and validates the
+DEB package/version/architecture before copying it to
+`dist/<package>_<version>_<architecture>.deb`. K230 Debian builds require a Debian
+riscv64 toolchain and sysroot; the Buildroot `k230-cross` preset is a separate target.
+Architecture selection flags require the CMake backend.
 
 The default output directory is `dist/`. When the command completes, it lists every `.deb` file generated during the run. With `build.backend = "script"`, LPM runs `build.pack_command` with `{output}` set to the absolute output directory. It requires a new or updated `.deb`; unchanged existing packages do not count. `--preset` is only available with the CMake backend.
 
@@ -142,11 +201,14 @@ Upload a Debian package with SCP, then install it over SSH using `sudo apt-get i
 
 ```sh
 lpm deploy --host cm0.local --user pi
+lpm deploy --arch riscv64 --host 192.168.8.151 --user wing
 lpm deploy dist/lilygo-ui-weather-station_0.1.0_arm64.deb --host 192.168.1.42
 lpm deploy --target cm0-lab
 ```
 
-When no package is specified, LPM uses the newest `.deb` file in `dist/`. SSH uses the system's existing keys, agent, and `~/.ssh/config`; LPM does not store passwords. Add `--no-sudo` when the target user is already root. APT reinstalls the uploaded package even when its version is already installed, and resolves missing dependencies from the target's configured repositories; LPM does not update package indexes or activate runtime-specific services. After a successful installation, the uploaded file is removed from the target's `/tmp` directory. This workflow also supports runtime packages; service configuration remains the device or image's responsibility.
+With a saved single-platform target or `--arch`, LPM reads the Debian control metadata and selects the newest matching package for the project's package name and configured version, excluding CPack staging directories. Combining a package path with `--arch` validates the file's architecture before uploading. Multi-architecture projects require a saved single-platform target, `--arch`, or an explicit package path.
+
+For single-architecture projects with no saved target, package path, or `--arch`, LPM uses the newest `.deb` file in `dist/`. SSH uses the system's existing keys, agent, and `~/.ssh/config`; LPM does not store passwords. Add `--no-sudo` when the target user is already root. APT reinstalls the uploaded package even when its version is already installed, and resolves missing dependencies from the target's configured repositories; LPM does not update package indexes or activate runtime-specific services. After a successful installation, the uploaded file is removed from the target's `/tmp` directory. This workflow also supports runtime packages; service configuration remains the device or image's responsibility.
 
 To switch between multiple target boards in the same project, add standard OpenSSH configuration to `.lpm/ssh_config`:
 
@@ -188,13 +250,26 @@ validates the submission without secrets. After review and merge, its trusted
 workflow copies the `.deb` into the central package Release and deploys a new
 GitHub Pages snapshot.
 
-Declare exactly one architecture in `project.compatibility.architectures`, such
-as `["arm64"]`, `["amd64"]`, `["armhf"]`, or `["all"]`. LPM preserves that value
-and requires the Debian `Architecture` field to match it exactly. Architecture
-wildcards and `source` are rejected. Each package version still stores one Debian
-artifact; publishing another architecture does not replace an existing version.
-The matching `packages` schema update must be merged before publishing a new
-architecture. See [configuration details](docs/configuration.md).
+Declare supported architectures in `project.compatibility.architectures`, for example
+`["arm64", "riscv64"]`. Each DEB must match one declared architecture; its registry
+manifest is narrowed to that architecture. Use `["all"]` alone for an architecture-independent
+package. Wildcards and `source` are rejected. New releases use
+`releases/<version>_<architecture>.json`, alongside existing `<version>.json` records.
+The same version can have multiple architecture variants. Replacing an existing
+variant still requires yanking it first and publishing with `--force`.
+Merge the corresponding `packages` validator/schema update before publishing.
+
+```sh
+lpm publish --all-architectures
+lpm publish dist/lilygo-ui-demo_1.0.0_arm64.deb dist/lilygo-ui-demo_1.0.0_riscv64.deb
+lpm unpublish 1.0.0 --arch riscv64 --reason "K230 startup failure"
+```
+
+A batch creates one commit and review PR, after checking every artifact locally.
+Multi-architecture projects can use `set-target` or select files, `--arch`, or
+`--all-architectures` when publishing. Deployment requires a saved single-platform
+target, `--arch`, or an explicit DEB path. See
+[configuration details](docs/configuration.md).
 
 `publish --runtime` submits a Debian runtime package such as `meshtasticd` to
 `runtimes/<package>/` using the package name, version, and architecture from its

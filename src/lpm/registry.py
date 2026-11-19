@@ -34,9 +34,7 @@ RELEASE_SCHEMA_URL = "https://raw.githubusercontent.com/LILYGO-UI/packages/main/
 RUNTIME_SCHEMA_URL = (
     "https://raw.githubusercontent.com/LILYGO-UI/packages/main/runtime.schema.json"
 )
-RUNTIME_RELEASE_SCHEMA_URL = (
-    "https://raw.githubusercontent.com/LILYGO-UI/packages/main/runtime-release.schema.json"
-)
+RUNTIME_RELEASE_SCHEMA_URL = "https://raw.githubusercontent.com/LILYGO-UI/packages/main/runtime-release.schema.json"
 
 
 @dataclass(frozen=True)
@@ -89,155 +87,309 @@ def inspect_debian_package(path: Path) -> DebianArtifact:
     )
 
 
+def _release_record(
+    client: GitHubClient,
+    registry: str,
+    prefix: str,
+    version: str,
+    architecture: str | None,
+    ref: str,
+) -> tuple[str, dict[str, Any] | None]:
+    legacy_path = f"{prefix}/releases/{version}.json"
+    legacy = client.file_json(registry, legacy_path, ref=ref)
+    if architecture is None:
+        if legacy is None:
+            raise LpmError("specify --arch to select the release architecture")
+        return legacy_path, legacy
+    if (
+        not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", architecture)
+        or len(architecture) > 64
+        or architecture == "source"
+        or "any" in architecture.split("-")
+    ):
+        raise LpmError("invalid Debian architecture")
+    path = f"{prefix}/releases/{version}_{architecture}.json"
+    current = client.file_json(registry, path, ref=ref)
+    if legacy is not None and legacy["artifact"]["architecture"] == architecture:
+        if current is not None:
+            raise LpmError("registry contains duplicate version/architecture records")
+        return legacy_path, legacy
+    return path, current
+
+
+def _publication_artifacts(
+    project: Project,
+    *,
+    package_path: Path | None,
+    package_paths: list[Path] | None,
+    architecture: str | None,
+    all_architectures: bool,
+    runtime: bool,
+) -> list[DebianArtifact]:
+    if package_path is not None and package_paths:
+        raise LpmError("specify package_path or package_paths, not both")
+    if all_architectures and architecture is not None:
+        raise LpmError("--all-architectures cannot be combined with --arch")
+    manifest = (
+        None
+        if runtime or project.kind == "runtime"
+        else build_publish_manifest(project)
+    )
+    declared = manifest["compatibility"]["architectures"] if manifest else []
+    if architecture is not None and declared and architecture not in declared:
+        raise LpmError(f"architecture {architecture!r} is not declared by lpm.toml")
+    paths = package_paths or ([package_path] if package_path is not None else [])
+    if paths:
+        artifacts = [inspect_debian_package(path) for path in paths]
+    elif architecture is not None or all_architectures:
+        if all_architectures and not declared:
+            raise LpmError("runtime publication requires explicit Debian package paths")
+        output = project.root / str(project.get("build", "package_dir", "dist"))
+        candidates = [
+            inspect_debian_package(path)
+            for path in sorted(output.rglob("*.deb"))
+            if path.is_file()
+            and "_CPack_Packages" not in path.relative_to(output).parts
+        ]
+        selected = declared if all_architectures else [architecture]
+        artifacts = []
+        for arch in selected:
+            matches = [
+                item
+                for item in candidates
+                if item.architecture == arch
+                and (
+                    manifest is None
+                    or (
+                        item.package == manifest["package"]
+                        and item.version == manifest["version"]
+                    )
+                )
+            ]
+            if len(matches) != 1:
+                raise LpmError(
+                    f"expected exactly one {arch} package for this project/version in {output}; pass package paths explicitly"
+                )
+            artifacts.extend(matches)
+    else:
+        if len(declared) > 1:
+            raise LpmError(
+                "multi-architecture projects require --arch, --all-architectures, or explicit package paths"
+            )
+        artifacts = [inspect_debian_package(_latest_package(project))]
+    identities = {(item.package, item.version) for item in artifacts}
+    arches = [item.architecture for item in artifacts]
+    if len(identities) != 1 or len(set(arches)) != len(arches):
+        raise LpmError(
+            "publish requires one package/version and one artifact per architecture"
+        )
+    if "all" in arches and len(arches) > 1:
+        raise LpmError(
+            "cannot publish 'all' alongside concrete architectures for one version"
+        )
+    if architecture is not None and arches != [architecture]:
+        raise LpmError(f"Debian Architecture must match --arch {architecture}")
+    if all_architectures and set(arches) != set(declared):
+        raise LpmError("packages must cover every declared architecture")
+    for artifact in artifacts:
+        if manifest is not None:
+            _match_artifact(manifest, artifact)
+        elif project.kind == "runtime" and artifact.package != project.get(
+            "project", "package"
+        ):
+            raise LpmError(
+                f"Debian Package is {artifact.package}, expected {project.get('project', 'package')}"
+            )
+        if not _REGISTRY_VERSION_PATTERN.fullmatch(artifact.version):
+            raise LpmError(f"invalid Debian version: {artifact.version}")
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9+.-]*[a-z0-9])?", artifact.package):
+            raise LpmError("invalid Debian package name")
+    return artifacts
+
+
 def publish(
     project: Project,
     *,
     package_path: Path | None = None,
+    package_paths: list[Path] | None = None,
+    architecture: str | None = None,
+    all_architectures: bool = False,
     force: bool = False,
     runtime: bool = False,
     registry: str = DEFAULT_REGISTRY,
     client: GitHubClient | None = None,
 ) -> Submission:
-    package_path = package_path.resolve() if package_path else _latest_package(project)
-    artifact = inspect_debian_package(package_path)
-    if runtime or project.kind == "runtime":
-        return _publish_runtime(
-            project,
-            artifact,
-            force=force,
-            registry=registry,
-            client=client,
+    artifacts = _publication_artifacts(
+        project,
+        package_path=package_path,
+        package_paths=package_paths,
+        architecture=architecture,
+        all_architectures=all_architectures,
+        runtime=runtime,
+    )
+    is_runtime = runtime or project.kind == "runtime"
+    package_name, version = artifacts[0].package, artifacts[0].version
+    prefix = f"{'runtimes' if is_runtime else 'apps'}/{package_name}"
+    ownership_path = f"{prefix}/{'runtime' if is_runtime else 'app'}.json"
+    manifest = None
+    asset_files: dict[str, bytes] = {}
+    if not is_runtime:
+        manifest, asset_files = _registry_assets(
+            project, build_publish_manifest(project)
         )
-    project.require_application("publish")
-    manifest = build_publish_manifest(project)
-    _match_artifact(manifest, artifact)
-
     client = client or GitHubClient.authenticated()
     login = client.current_user()
     base_branch, base_sha, base_tree = client.branch_base(registry)
-    package_name = str(manifest["package"])
-    version = str(manifest["version"])
-    app_path = f"apps/{package_name}/app.json"
-    release_path = f"apps/{package_name}/releases/{version}.json"
-    app = client.file_json(registry, app_path, ref=base_sha)
-    previous = client.file_json(registry, release_path, ref=base_sha)
-    if previous is not None:
-        if not force:
-            hint = (
-                "; use lpm publish --force to replace this yanked version"
-                if previous.get("status") == "yanked"
-                else ""
-            )
-            raise LpmError(f"{package_name} {version} already exists in the registry{hint}")
-        if previous.get("status") != "yanked":
-            raise LpmError(
-                f"{package_name} {version}: --force can only replace a yanked version; "
-                "unpublish must be merged first"
-            )
-        if app is None:
-            raise LpmError(f"registry ownership record does not exist: {package_name}")
-    app_file = _app_file(app, package_name, str(manifest["app_id"]), login)
-    if previous is not None:
-        if any(
-            previous["manifest"].get(key) != manifest[key]
-            for key in ("package", "version", "app_id")
-        ):
-            raise LpmError("--force cannot change the existing release identity")
-        if previous["artifact"]["architecture"] != artifact.architecture:
-            raise LpmError("--force cannot change the existing release architecture")
+    ownership = client.file_json(registry, ownership_path, ref=base_sha)
+    ownership_file = (
+        _runtime_file(ownership, package_name, login)
+        if is_runtime
+        else _app_file(ownership, package_name, str(manifest["app_id"]), login)
+    )
+    plans = []
+    for artifact in artifacts:
+        path, previous = _release_record(
+            client, registry, prefix, version, artifact.architecture, base_sha
+        )
+        if previous is not None:
+            if not force:
+                hint = (
+                    "; use lpm publish --force to replace this yanked version"
+                    if previous.get("status") == "yanked"
+                    else ""
+                )
+                raise LpmError(
+                    f"{package_name} {version} {artifact.architecture} already exists in the registry{hint}"
+                )
+            if previous.get("status") != "yanked":
+                raise LpmError(
+                    f"{package_name} {version}: --force can only replace a yanked version; unpublish must be merged first"
+                )
+            if ownership is None:
+                raise LpmError(
+                    f"registry ownership record does not exist: {package_name}"
+                )
+            expected = {"package": package_name, "version": version}
+            if manifest is not None:
+                expected["app_id"] = manifest["app_id"]
+            if any(
+                previous["manifest"].get(key) != value
+                for key, value in expected.items()
+            ):
+                raise LpmError("--force cannot change the existing release identity")
+            if previous["artifact"]["architecture"] != artifact.architecture:
+                raise LpmError(
+                    "--force cannot change the existing release architecture"
+                )
+        plans.append((artifact, path, previous))
 
     fork = client.ensure_fork(registry, login)
     client.sync_fork(fork, branch=base_branch)
     safe_version = re.sub(r"[^A-Za-z0-9._-]+", "-", version).strip("-") or "version"
-    asset_name = f"sha256-{artifact.sha256}.deb"
-    tag = f"lpm-staging-{package_name}-{safe_version}-{artifact.sha256[:12]}"
-    source_url = _release_download_url(fork, tag, asset_name)
-    central_tag = f"apt-pool-{package_name}"
-    central_url = _release_download_url(registry, central_tag, asset_name)
-
-    registry_manifest, asset_files = _registry_assets(project, manifest)
-    release_record = {
-        "$schema": RELEASE_SCHEMA_URL,
-        "schema_version": 1,
-        "status": "published",
-        "submitted_by": login,
-        "manifest": registry_manifest,
-        "artifact": {
-            "architecture": artifact.architecture,
-            "size": artifact.size,
-            "sha256": artifact.sha256,
-            "media_type": "application/vnd.debian.binary-package",
-            "source": {
-                "repository": fork,
-                "tag": tag,
-                "asset": asset_name,
-                "url": source_url,
+    files: dict[str, bytes] = dict(asset_files)
+    staged = []
+    notes = []
+    for artifact, path, previous in plans:
+        asset_name = f"sha256-{artifact.sha256}.deb"
+        tag = f"lpm-staging-{package_name}-{safe_version}-{artifact.sha256[:12]}"
+        source_url = _release_download_url(fork, tag, asset_name)
+        central_tag = f"apt-pool-{package_name}"
+        if is_runtime:
+            registry_manifest = {
+                "$schema": RUNTIME_RELEASE_SCHEMA_URL,
+                "schema_version": 1,
+                "package": package_name,
+                "version": version,
+                "compatibility": {"architectures": [artifact.architecture]},
+            }
+        else:
+            registry_manifest = json.loads(json.dumps(manifest))
+            registry_manifest["compatibility"]["architectures"] = [
+                artifact.architecture
+            ]
+        record = {
+            "$schema": RUNTIME_RELEASE_SCHEMA_URL if is_runtime else RELEASE_SCHEMA_URL,
+            "schema_version": 1,
+            "status": "published",
+            "submitted_by": login,
+            "manifest": registry_manifest,
+            "artifact": {
+                "architecture": artifact.architecture,
+                "size": artifact.size,
+                "sha256": artifact.sha256,
+                "media_type": "application/vnd.debian.binary-package",
+                "source": {
+                    "repository": fork,
+                    "tag": tag,
+                    "asset": asset_name,
+                    "url": source_url,
+                },
+                "central": {
+                    "repository": registry,
+                    "tag": central_tag,
+                    "asset": asset_name,
+                    "url": _release_download_url(registry, central_tag, asset_name),
+                },
             },
-            "central": {
-                "repository": registry,
-                "tag": central_tag,
-                "asset": asset_name,
-                "url": central_url,
-            },
-        },
-    }
-    files = {
-        release_path: _json_bytes(release_record),
-        **asset_files,
-    }
-    if app is None:
-        files[app_path] = _json_bytes(app_file)
-
-    operation = "Republish" if previous is not None else "Publish"
-    branch = f"lpm/{operation.lower()}/{package_name}/{safe_version}-{secrets.token_hex(4)}"
+        }
+        files[path] = _json_bytes(record)
+        staged.append((artifact, tag, asset_name, source_url))
+        if previous is not None:
+            notes.append(
+                f"{artifact.architecture}: Previous SHA-256: `{previous['artifact']['sha256']}`; Replacement SHA-256: `{artifact.sha256}`. The previous content-addressed Debian asset is retained."
+            )
+    if ownership is None:
+        files[ownership_path] = _json_bytes(ownership_file)
+    operation = (
+        "Republish"
+        if any(previous is not None for _, _, previous in plans)
+        else "Publish"
+    )
+    arch_label = ", ".join(item.architecture for item in artifacts)
+    title = f"{operation} {package_name} {version} ({arch_label})"
+    branch = (
+        f"lpm/{operation.lower()}/{package_name}/{safe_version}-{secrets.token_hex(4)}"
+    )
     commit_sha = client.commit_files(
         fork,
         branch=branch,
         parent_sha=base_sha,
         base_tree_sha=base_tree,
         files=files,
-        message=f"{operation} {package_name} {version}",
+        message=title,
     )
-    release = client.create_release(
-        fork,
-        tag=tag,
-        target=commit_sha,
-        title=f"LPM staging: {package_name} {version}",
-        body="Temporary public artifact used by the LILYGO packages review workflow.",
-        prerelease=True,
-    )
-    uploaded_url = client.ensure_release_asset(
-        fork,
-        release,
-        path=artifact.path,
-        name=asset_name,
-        content_type="application/vnd.debian.binary-package",
-    )
-    if uploaded_url != source_url:
-        raise LpmError(
-            "GitHub changed the staging asset URL unexpectedly; the submission was not opened"
+    for artifact, tag, asset_name, source_url in staged:
+        release = client.create_release(
+            fork,
+            tag=tag,
+            target=commit_sha,
+            title=f"LPM staging: {package_name} {version} ({artifact.architecture})",
+            body="Temporary public artifact used by the LILYGO packages review workflow.",
+            prerelease=True,
         )
-    replacement_note = (
-        "Replace the previously yanked package without changing its version or architecture.\n\n"
-        f"Previous SHA-256: `{previous['artifact']['sha256']}`\n\n"
-        f"Replacement SHA-256: `{artifact.sha256}`\n\n"
-        "The previous content-addressed Debian asset is retained.\n\n"
-        if previous is not None
-        else ""
-    )
+        uploaded_url = client.ensure_release_asset(
+            fork,
+            release,
+            path=artifact.path,
+            name=asset_name,
+            content_type="application/vnd.debian.binary-package",
+        )
+        if uploaded_url != source_url:
+            raise LpmError(
+                "GitHub changed the staging asset URL unexpectedly; the submission was not opened"
+            )
     pr_url = client.create_pull_request(
         registry,
-        title=f"{operation} {package_name} {version}",
+        title=title,
         body=(
-            f"{operation} `{package_name}` version `{version}`.\n\n"
-            f"{replacement_note}"
-            f"Submitted by `lpm` as `{login}`. The artifact is staged in the submitter's "
-            "public fork and must be copied by the trusted promotion workflow."
+            f"{operation} `{package_name}` version `{version}` for `{arch_label}`.\n\n"
+            + "\n\n".join(notes)
+            + f"\n\nSubmitted by `lpm` as `{login}`. The artifacts are staged in the submitter's public fork and must be copied by the trusted promotion workflow."
         ),
         head=f"{login}:{branch}",
         base=base_branch,
     )
-    return Submission(pr_url, package_name, version, source_url)
+    return Submission(pr_url, package_name, version, staged[0][3])
 
 
 def unpublish(
@@ -245,6 +397,7 @@ def unpublish(
     *,
     version: str,
     reason: str,
+    architecture: str | None = None,
     registry: str = DEFAULT_REGISTRY,
     client: GitHubClient | None = None,
 ) -> Submission:
@@ -257,20 +410,26 @@ def unpublish(
             project,
             version=version,
             reason=reason,
+            architecture=architecture,
             registry=registry,
             client=client,
         )
     project.require_application("unpublish")
     manifest = build_publish_manifest(project)
     package_name = str(manifest["package"])
+    declared = manifest["compatibility"]["architectures"]
+    if architecture is None and len(declared) > 1:
+        raise LpmError("multi-architecture projects require --arch when unpublishing")
+    architecture = architecture or declared[0]
     client = client or GitHubClient.authenticated()
     login = client.current_user()
     base_branch, base_sha, base_tree = client.branch_base(registry)
     app_path = f"apps/{package_name}/app.json"
-    release_path = f"apps/{package_name}/releases/{version}.json"
-    app = client.file_json(registry, app_path, ref=base_branch)
+    release_path, release = _release_record(
+        client, registry, f"apps/{package_name}", version, architecture, base_sha
+    )
+    app = client.file_json(registry, app_path, ref=base_sha)
     _app_file(app, package_name, str(manifest["app_id"]), login)
-    release = client.file_json(registry, release_path, ref=base_branch)
     if release is None:
         raise LpmError(f"registry release does not exist: {package_name} {version}")
     if release.get("status") == "yanked":
@@ -279,6 +438,7 @@ def unpublish(
         raise LpmError(
             f"{package_name} {version} cannot be unpublished from its current state"
         )
+    release = json.loads(json.dumps(release))
     release["status"] = "yanked"
     release["yank"] = {"reason": reason.strip(), "requested_by": login}
 
@@ -292,11 +452,11 @@ def unpublish(
         parent_sha=base_sha,
         base_tree_sha=base_tree,
         files={release_path: _json_bytes(release)},
-        message=f"Unpublish {package_name} {version}",
+        message=f"Unpublish {package_name} {version} ({release['artifact']['architecture']})",
     )
     pr_url = client.create_pull_request(
         registry,
-        title=f"Unpublish {package_name} {version}",
+        title=f"Unpublish {package_name} {version} ({release['artifact']['architecture']})",
         body=(
             f"Yank `{package_name}` version `{version}`.\n\n"
             f"Reason: {reason.strip()}\n\nRequested by `{login}`."
@@ -307,150 +467,12 @@ def unpublish(
     return Submission(pr_url, package_name, version)
 
 
-def _publish_runtime(
-    project: Project,
-    artifact: DebianArtifact,
-    *,
-    force: bool,
-    registry: str,
-    client: GitHubClient | None,
-) -> Submission:
-    configured_package = str(project.get("project", "package", ""))
-    package_name = artifact.package if project.kind != "runtime" else configured_package
-    if project.kind == "runtime" and artifact.package != package_name:
-        raise LpmError(
-            f"Debian Package is {artifact.package}, expected {package_name}"
-        )
-
-    client = client or GitHubClient.authenticated()
-    login = client.current_user()
-    base_branch, base_sha, base_tree = client.branch_base(registry)
-    runtime_path = f"runtimes/{package_name}/runtime.json"
-    release_path = f"runtimes/{package_name}/releases/{artifact.version}.json"
-    runtime = client.file_json(registry, runtime_path, ref=base_sha)
-    previous = client.file_json(registry, release_path, ref=base_sha)
-    if previous is not None:
-        if not force:
-            hint = (
-                "; use lpm publish --force to replace this yanked version"
-                if previous.get("status") == "yanked"
-                else ""
-            )
-            raise LpmError(f"{package_name} {artifact.version} already exists in the registry{hint}")
-        if previous.get("status") != "yanked":
-            raise LpmError(
-                f"{package_name} {artifact.version}: --force can only replace a yanked version; "
-                "unpublish must be merged first"
-            )
-        if runtime is None:
-            raise LpmError(f"registry ownership record does not exist: {package_name}")
-        if previous["manifest"].get("package") != package_name or previous["manifest"].get("version") != artifact.version:
-            raise LpmError("--force cannot change the existing release identity")
-        if previous["artifact"]["architecture"] != artifact.architecture:
-            raise LpmError("--force cannot change the existing release architecture")
-    runtime_file = _runtime_file(runtime, package_name, login)
-
-    fork = client.ensure_fork(registry, login)
-    client.sync_fork(fork, branch=base_branch)
-    safe_version = re.sub(r"[^A-Za-z0-9._-]+", "-", artifact.version).strip("-") or "version"
-    asset_name = f"sha256-{artifact.sha256}.deb"
-    tag = f"lpm-staging-{package_name}-{safe_version}-{artifact.sha256[:12]}"
-    source_url = _release_download_url(fork, tag, asset_name)
-    central_tag = f"apt-pool-{package_name}"
-    central_url = _release_download_url(registry, central_tag, asset_name)
-    manifest: dict[str, Any] = {
-        "$schema": RUNTIME_RELEASE_SCHEMA_URL,
-        "schema_version": 1,
-        "package": package_name,
-        "version": artifact.version,
-        "compatibility": {"architectures": [artifact.architecture]},
-    }
-    release_record = {
-        "$schema": RUNTIME_RELEASE_SCHEMA_URL,
-        "schema_version": 1,
-        "status": "published",
-        "submitted_by": login,
-        "manifest": manifest,
-        "artifact": {
-            "architecture": artifact.architecture,
-            "size": artifact.size,
-            "sha256": artifact.sha256,
-            "media_type": "application/vnd.debian.binary-package",
-            "source": {
-                "repository": fork,
-                "tag": tag,
-                "asset": asset_name,
-                "url": source_url,
-            },
-            "central": {
-                "repository": registry,
-                "tag": central_tag,
-                "asset": asset_name,
-                "url": central_url,
-            },
-        },
-    }
-    files = {release_path: _json_bytes(release_record)}
-    if runtime is None:
-        files[runtime_path] = _json_bytes(runtime_file)
-
-    operation = "Republish" if previous is not None else "Publish"
-    branch = f"lpm/{operation.lower()}/{package_name}/{safe_version}-{secrets.token_hex(4)}"
-    commit_sha = client.commit_files(
-        fork,
-        branch=branch,
-        parent_sha=base_sha,
-        base_tree_sha=base_tree,
-        files=files,
-        message=f"{operation} {package_name} {artifact.version}",
-    )
-    release = client.create_release(
-        fork,
-        tag=tag,
-        target=commit_sha,
-        title=f"LPM staging: {package_name} {artifact.version}",
-        body="Temporary public artifact used by the LILYGO packages review workflow.",
-        prerelease=True,
-    )
-    uploaded_url = client.ensure_release_asset(
-        fork,
-        release,
-        path=artifact.path,
-        name=asset_name,
-        content_type="application/vnd.debian.binary-package",
-    )
-    if uploaded_url != source_url:
-        raise LpmError(
-            "GitHub changed the staging asset URL unexpectedly; the submission was not opened"
-        )
-    replacement_note = (
-        "Replace the previously yanked package without changing its version or architecture.\n\n"
-        f"Previous SHA-256: `{previous['artifact']['sha256']}`\n\n"
-        f"Replacement SHA-256: `{artifact.sha256}`\n\n"
-        "The previous content-addressed Debian asset is retained.\n\n"
-        if previous is not None
-        else ""
-    )
-    pr_url = client.create_pull_request(
-        registry,
-        title=f"{operation} {package_name} {artifact.version}",
-        body=(
-            f"{operation} runtime `{package_name}` version `{artifact.version}`.\n\n"
-            f"{replacement_note}"
-            f"Submitted by `lpm` as `{login}`. The artifact is staged in the submitter's "
-            "public fork and must be copied by the trusted promotion workflow."
-        ),
-        head=f"{login}:{branch}",
-        base=base_branch,
-    )
-    return Submission(pr_url, package_name, artifact.version, source_url)
-
-
 def _unpublish_runtime(
     project: Project,
     *,
     version: str,
     reason: str,
+    architecture: str | None,
     registry: str,
     client: GitHubClient | None,
 ) -> Submission:
@@ -459,10 +481,11 @@ def _unpublish_runtime(
     login = client.current_user()
     base_branch, base_sha, base_tree = client.branch_base(registry)
     runtime_path = f"runtimes/{package_name}/runtime.json"
-    release_path = f"runtimes/{package_name}/releases/{version}.json"
-    runtime = client.file_json(registry, runtime_path, ref=base_branch)
+    release_path, release = _release_record(
+        client, registry, f"runtimes/{package_name}", version, architecture, base_sha
+    )
+    runtime = client.file_json(registry, runtime_path, ref=base_sha)
     _runtime_file(runtime, package_name, login)
-    release = client.file_json(registry, release_path, ref=base_branch)
     if release is None:
         raise LpmError(f"registry release does not exist: {package_name} {version}")
     if release.get("status") == "yanked":
@@ -471,6 +494,7 @@ def _unpublish_runtime(
         raise LpmError(
             f"{package_name} {version} cannot be unpublished from its current state"
         )
+    release = json.loads(json.dumps(release))
     release["status"] = "yanked"
     release["yank"] = {"reason": reason.strip(), "requested_by": login}
     fork = client.ensure_fork(registry, login)
@@ -483,11 +507,11 @@ def _unpublish_runtime(
         parent_sha=base_sha,
         base_tree_sha=base_tree,
         files={release_path: _json_bytes(release)},
-        message=f"Unpublish {package_name} {version}",
+        message=f"Unpublish {package_name} {version} ({release['artifact']['architecture']})",
     )
     pr_url = client.create_pull_request(
         registry,
-        title=f"Unpublish {package_name} {version}",
+        title=f"Unpublish {package_name} {version} ({release['artifact']['architecture']})",
         body=(
             f"Yank runtime `{package_name}` version `{version}`.\n\n"
             f"Reason: {reason.strip()}\n\nRequested by `{login}`."
@@ -535,7 +559,9 @@ def _runtime_file(
             "owners": [login],
         }
     if current.get("package") != package:
-        raise LpmError(f"registry identity does not match local runtime project: {package}")
+        raise LpmError(
+            f"registry identity does not match local runtime project: {package}"
+        )
     owners = current.get("owners")
     if not isinstance(owners, list) or login.lower() not in {
         str(owner).lower() for owner in owners
@@ -601,7 +627,11 @@ def _registry_assets(
 
 def _latest_package(project: Project) -> Path:
     output = project.root / str(project.get("build", "package_dir", "dist"))
-    packages = [path for path in output.rglob("*.deb") if path.is_file()]
+    packages = [
+        path
+        for path in output.rglob("*.deb")
+        if path.is_file() and "_CPack_Packages" not in path.relative_to(output).parts
+    ]
     if not packages:
         raise LpmError(f"no Debian package found under {output}; run lpm pack first")
     return max(packages, key=lambda path: path.stat().st_mtime).resolve()

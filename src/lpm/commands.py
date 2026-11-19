@@ -133,18 +133,52 @@ def _customize_template(target: Path, *, name: str, version: str, description: s
     config_path.write_text(render_config(config), encoding="utf-8")
 
 
-def generate_metadata(project: Project, *, output_format: str) -> str:
+def generate_metadata(project: Project, *, output_format: str, architecture: str | None = None) -> str:
     if output_format == "cmake":
-        return render_cmake_metadata(project)
+        return render_cmake_metadata(project, architecture=architecture)
     if output_format == "publish-json":
-        return render_publish_json(project)
+        return render_publish_json(project, architecture=architecture)
     raise LpmError(f"unsupported metadata format: {output_format}")
 
 
-def configure_and_build(project: Project, preset: str) -> None:
+def _cmake_lpm_executable(project: Project) -> Path:
+    entrypoint = Path(os.path.abspath(sys.argv[0]))
+    if (
+        entrypoint.name in {"lpm", "lpm.exe"}
+        and entrypoint.is_file()
+        and os.access(entrypoint, os.X_OK)
+    ):
+        return entrypoint
+
+    # python -m lpm and callers importing this module have no console script.
+    # Keep CMake on this interpreter and package instead of another lpm on PATH.
+    launcher = project.state_dir / "cmake-lpm"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    source_root = str(Path(__file__).resolve().parent.parent)
+    code = (
+        f"import sys; sys.path.insert(0, {source_root!r}); "
+        "from lpm.cli import main; raise SystemExit(main())"
+    )
+    launcher.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(code)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    return launcher.absolute()
+
+
+def configure_and_build(project: Project, preset: str, *, configure_args: tuple[str, ...] = ()) -> None:
     require_tool("cmake")
-    run(["cmake", "--preset", preset], cwd=project.root)
-    run(["cmake", "--build", "--preset", preset, "--parallel"], cwd=project.root)
+    configure = ["cmake", "--preset", preset, f"-DLPM_EXECUTABLE:FILEPATH={_cmake_lpm_executable(project)}"]
+    configure.extend(configure_args)
+    run(configure, cwd=project.root)
+    command = ["cmake", "--build", "--preset", preset]
+    # Bare --parallel overrides CMake's environment limit with the build
+    # tool's default (unlimited jobs for Make). Let CMake read the caller's
+    # limit itself when it is supplied, including its documented empty value.
+    if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
+        command.append("--parallel")
+    run(command, cwd=project.root)
 
 
 def start(
@@ -339,11 +373,82 @@ def test(project: Project, *, preset: str | None = None, report: Path | None = N
     return report
 
 
-def pack(project: Project, *, preset: str | None = None, output: Path | None = None) -> list[Path]:
+def pack(
+    project: Project, *, preset: str | None = None, output: Path | None = None,
+    architecture: str | None = None, all_architectures: bool = False,
+) -> list[Path]:
+    if all_architectures and (architecture is not None or preset is not None):
+        raise LpmError("--all-architectures cannot be combined with --arch or --preset")
+    presets = project.cross_presets()
     if project.build_backend == "script":
+        if architecture is not None or all_architectures:
+            raise LpmError("--arch and --all-architectures require the cmake build backend")
         return pack_script(project, preset=preset, output=output)
+    # Existing single-architecture projects only define cross_preset. Allow
+    # target selection without requiring them to add a redundant mapping.
+    declared = project.get("project", "compatibility", {}).get("architectures", [])
+    if not presets and len(declared) == 1 and (architecture is not None or all_architectures):
+        presets = {declared[0]: str(project.get("build", "cross_preset", "cm0-cross"))}
+    if all_architectures:
+        architectures = (
+            build_publish_manifest(project)["compatibility"]["architectures"]
+            if project.kind == "application" else list(presets)
+        )
+        if not architectures or any(arch not in presets for arch in architectures):
+            raise LpmError("build.cross_presets must define every architecture before packing all architectures")
+    else:
+        if architecture is None:
+            selected = preset or str(project.get("build", "cross_preset", "cm0-cross"))
+            architecture = next((arch for arch, value in presets.items() if value == selected), None)
+        architectures = [architecture] if architecture is not None else []
+    if not architectures:
+        declared = project.get("project", "compatibility", {}).get("architectures", [])
+        if len(declared) > 1:
+            raise LpmError("multi-architecture projects require a matching build.cross_presets entry")
+        return _pack_cmake(project, preset=preset, output=output)
+
+    for arch in architectures:
+        if arch not in presets:
+            raise LpmError(f"build.cross_presets has no preset for {arch!r}")
+        if preset is not None and preset != presets[arch]:
+            raise LpmError(f"--preset does not match the configured preset for {arch}")
+        if project.kind == "application":
+            build_publish_manifest(project, architecture=arch)
+
+    from .registry import inspect_debian_package
+
+    destination = (output or project.root / str(project.get("build", "package_dir", "dist"))).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    packages: list[Path] = []
+    # Isolate each invocation: timestamp scans of a shared dist directory can
+    # otherwise pick up the previous architecture's package.
+    for arch in architectures:
+        with tempfile.TemporaryDirectory(prefix="lpm-pack-") as temporary:
+            produced = _pack_cmake(project, preset=presets[arch], output=Path(temporary))
+            artifacts = [inspect_debian_package(path) for path in produced]
+            for artifact in artifacts:
+                if artifact.architecture != arch:
+                    raise LpmError(f"Debian Architecture is {artifact.architecture}, expected {arch}")
+                if project.kind == "application":
+                    manifest = build_publish_manifest(project, architecture=arch)
+                    if artifact.package != manifest["package"] or artifact.version != manifest["version"]:
+                        raise LpmError("generated Debian package identity does not match lpm.toml")
+            for artifact in artifacts:
+                target = destination / f"{artifact.package}_{artifact.version}_{artifact.architecture}.deb"
+                shutil.copy2(artifact.path, target)
+                packages.append(target)
+    return packages
+
+
+def _pack_cmake(project: Project, *, preset: str | None, output: Path | None) -> list[Path]:
     preset = preset or str(project.get("build", "cross_preset", "cm0-cross"))
-    configure_and_build(project, preset)
+    if preset == "k230-debian" or preset == project.cross_presets().get("riscv64"):
+        from .k230_sdk import prepare_pack
+
+        options = prepare_pack(project.root, project.root / "build" / preset)
+        configure_and_build(project, preset, configure_args=options)
+    else:
+        configure_and_build(project, preset)
     require_tool("cpack")
     output = (output or project.root / str(project.get("build", "package_dir", "dist"))).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -369,6 +474,7 @@ def deploy(
     project: Project,
     *,
     package: Path | None = None,
+    architecture: str | None = None,
     host: str | None = None,
     target: str | None = None,
     user: str | None = None,
@@ -390,9 +496,21 @@ def deploy(
             except (TypeError, ValueError):
                 raise LpmError("deploy port must be an integer") from None
     _validate_remote(host, user, port)
-    package = package.resolve() if package else _latest_package(project)
+    declared = project.get("project", "compatibility", {}).get("architectures", [])
+    if architecture is not None and declared and architecture not in declared:
+        raise LpmError(f"architecture {architecture!r} is not declared by lpm.toml")
+    explicit_package = package is not None
+    package = package.resolve() if package else _latest_package(project, architecture=architecture)
     if not package.is_file() or package.suffix != ".deb":
         raise LpmError(f"Debian package does not exist: {package}")
+    if explicit_package and architecture is not None:
+        from .registry import inspect_debian_package
+
+        artifact = inspect_debian_package(package)
+        if artifact.architecture != architecture:
+            raise LpmError(
+                f"Debian Architecture is {artifact.architecture}, expected {architecture}"
+            )
 
     require_tool("scp")
     require_tool("ssh")
@@ -425,12 +543,33 @@ def deploy(
     return package
 
 
-def _latest_package(project: Project) -> Path:
+def _latest_package(project: Project, *, architecture: str | None = None) -> Path:
+    if architecture is None and len(project.get("project", "compatibility", {}).get("architectures", [])) > 1:
+        raise LpmError(
+            "multi-architecture deployment requires --arch or an explicit Debian package path"
+        )
     output = project.root / str(project.get("build", "package_dir", "dist"))
     packages = [
         path for path in output.rglob("*.deb")
         if path.is_file() and "_CPack_Packages" not in path.relative_to(output).parts
     ]
+    if architecture is not None:
+        from .registry import inspect_debian_package
+
+        name = project.get("project", "package")
+        version = project.get("project", "version")
+        artifacts = [inspect_debian_package(path) for path in packages]
+        packages = [
+            item.path for item in artifacts
+            if item.architecture == architecture
+            and (not name or item.package == name)
+            and (not version or item.version == version)
+        ]
+        if not packages:
+            raise LpmError(
+                f"no {architecture} Debian package for this project/version under {output}; "
+                f"run lpm pack --arch {architecture} first or pass a package path explicitly"
+            )
     if not packages:
         raise LpmError(f"no Debian package found under {output}; run lpm pack first")
     return max(packages, key=lambda path: path.stat().st_mtime).resolve()

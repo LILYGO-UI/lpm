@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-`lpm` 是 LILYGO UI 的标准项目管理 CLI。它用 Python 3 开发，统一接管应用模板初始化、CMake 主机仿真、测试、AArch64 交叉编译、Debian 打包和 SSH 部署。运行库可通过脚本后端调用自身的构建和打包工具。
+`lpm` 是 LILYGO UI 的标准项目管理 CLI。它用 Python 3 开发，统一接管应用模板初始化、CMake 主机仿真、测试、AArch64 / RISC-V 64 交叉编译、Debian 打包和 SSH 部署。运行库可通过脚本后端调用自身的构建和打包工具。
 
 ## 环境要求
 
@@ -69,6 +69,34 @@ lpm init weather-station \
 
 下面给出常用操作；参数优先级、内部调用顺序、状态文件和失败处理见[命令业务逻辑](docs/commands.md)。
 
+### `lpm set-target`
+
+为当前项目保存目标平台，后续命令无需重复指定架构：
+
+```sh
+lpm set-target cm0       # arm64
+lpm pack
+lpm deploy --host cm0.local
+
+lpm set-target k230      # riscv64
+lpm pack
+lpm deploy --host 192.168.8.151 --user wing
+
+lpm set-target all       # 项目声明的全部架构
+lpm pack
+lpm publish
+```
+
+目标保存在项目的 `.lpm/target.json`，重开终端仍然有效，各项目独立保存。
+`pack`、`metadata`、`deploy`、`publish`、`unpublish` 默认使用该目标。
+显式传入 `--arch`、`--all-architectures`、`pack --preset` 或包文件路径时，
+仅覆盖本次命令的选择，不修改保存的目标。未设置目标时沿用原有默认行为。
+
+`all` 表示批量打包、发布项目声明的全部架构，或输出完整元数据，不是 Debian
+架构无关包的 `all` 类型。部署和下架一次只接受一个架构，需要切换到 `cm0` / `k230`
+或使用 `--arch`。`deploy --target` 仍单独表示 SSH 别名。
+模拟器命令和测试继续使用主机 preset；脚本后端的打包平台仍由项目脚本配置决定。
+
 ### `lpm start`
 
 配置并构建 `host-simulator` preset，执行可选的项目准备命令，然后在后台启动模拟器：
@@ -116,12 +144,38 @@ lpm test --report build/test-results.xml
 
 ### `lpm pack`
 
-配置并构建 `cm0-cross` preset，再读取 `build/cm0-cross/CPackConfig.cmake` 生成 Debian 包：
+在应用目录执行一次 `lpm set-target k230`，之后用 `lpm pack` 打包。LPM 在配置应用之前检查交叉编译器和 Debian 打包工具，缺少时通过本机的 Homebrew 或 APT 安装，并初始化缺失的 Git 子模块。Linux 主机安装系统软件包时可能需要 sudo。LPM 从 `LILYGO-UI/canaan-gen` Release 下载固定版本的 sysroot 并校验 SHA-256，将压缩包和解压内容保存在当前项目的 `.cache/k230-bsp/20261116T104343Z/`，再把 sysroot 的绝对路径交给 CMake。缓存就绪后可以离线打包。如需使用自备 sysroot，在执行 `lpm pack` 时设置 `LILYGO_UI_DEBIAN_SYSROOT`。
+
+为保存的目标平台构建 Debian 包。未设置目标且没有显式选择时，使用
+`build.cross_preset`（默认 `cm0-cross`）及其 CPack 配置：
 
 ```sh
 lpm pack
 lpm pack --output dist
+lpm pack --arch arm64
+lpm pack --arch riscv64
+lpm pack --all-architectures
 ```
+
+双平台项目需配置如下映射，并在 `CMakePresets.json` 中提供同名 configure/build preset：
+
+```toml
+[project.compatibility]
+architectures = ["arm64", "riscv64"]
+min_appkit_version = "0.1.0"
+
+[build.cross_presets]
+arm64 = "cm0-cross"
+riscv64 = "k230-debian"
+```
+
+未设置目标时，`lpm pack` 保留原有 `cross_preset` 默认选择；`set-target all` 或
+`--all-architectures` 顺序构建全部架构。单架构项目可以继续只配置 `cross_preset`，
+无需补充 `cross_presets` 映射。
+每个架构在独立临时目录打包，核对 Debian control 中的包名、版本和架构后复制到
+`dist/<package>_<version>_<architecture>.deb`。`--output` 可以覆盖 `dist`。
+K230 Debian preset 需要 Debian riscv64 工具链和 sysroot；`k230-cross` 面向 Buildroot。
+多架构选择参数仅支持 CMake 后端。
 
 默认产物目录为 `dist/`。命令结束时会列出本次生成的所有 `.deb` 文件。设置 `build.backend = "script"` 时，LPM 调用 `build.pack_command`，将 `{output}` 替换为输出目录的绝对路径。必须生成或更新至少一个 `.deb`；未变化的已有包不计入本次产物。`--preset` 仅适用于 CMake 后端。
 
@@ -142,11 +196,14 @@ CMake 格式由应用模板在配置阶段使用；运行库项目只输出运�
 
 ```sh
 lpm deploy --host cm0.local --user pi
+lpm deploy --arch riscv64 --host 192.168.8.151 --user wing
 lpm deploy dist/lilygo-ui-weather-station_0.1.0_arm64.deb --host 192.168.1.42
 lpm deploy --target cm0-lab
 ```
 
-未指定包时使用 `dist/` 下最新的 `.deb`。SSH 使用系统现有的密钥、agent 和 `~/.ssh/config`，LPM 不保存密码。目标用户已经是 root 时可加 `--no-sudo`。APT 会强制重新安装上传的包，即使目标机已安装相同版本，并从已配置的软件源解析缺失依赖；LPM 不会更新软件包索引，也不会启用私有图形驱动。安装成功后，上传到目标机 `/tmp` 的文件会被删除。运行库也使用同一部署流程；服务配置仍由设备或镜像负责。
+保存了单平台目标或指定 `--arch` 时，读取 DEB control 元数据，选择架构、项目包名和配置版本均匹配的最新包，排除 CPack 暂存目录。同时传入文件路径和 `--arch` 时，会在上传前校验实际架构。多架构项目需要保存的单平台目标、`--arch` 或 DEB 路径。
+
+未保存目标的单架构项目未指定包及 `--arch` 时使用 `dist/` 下最新的 `.deb`。SSH 使用系统现有的密钥、agent 和 `~/.ssh/config`，LPM 不保存密码。目标用户已经是 root 时可加 `--no-sudo`。APT 会强制重新安装上传的包，即使目标机已安装相同版本，并从已配置的软件源解析缺失依赖；LPM 不会更新软件包索引，也不会启用私有图形驱动。安装成功后，上传到目标机 `/tmp` 的文件会被删除。运行库也使用同一部署流程；服务配置仍由设备或镜像负责。
 
 需要在同一项目中切换多块目标板时，可将标准 OpenSSH 配置写入 `.lpm/ssh_config`：
 
@@ -185,12 +242,26 @@ Debian control 字段，创建或复用当前 GitHub 用户的公开 `packages` 
 提交；如果用户的 `packages` Fork 落后于中央仓库，LPM 会先快进同步其默认分支。审核合并后，受信任工作流把 `.deb` 转存到中央 Release，并部署新的 GitHub
 Pages 快照。
 
-`project.compatibility.architectures` 必须恰好声明一个架构，例如 `["arm64"]`、
-`["amd64"]`、`["armhf"]` 或 `["all"]`。LPM 保留该值，并要求 DEB 的
-`Architecture` 与它精确一致；拒绝架构通配符和 `source`。
-每个包版本仍只对应一个 DEB，不能用另一架构替换已存在的版本。
-发布新架构前，需要先将对应的 `packages` schema 更新合并到默认分支。
+`project.compatibility.architectures` 可声明多个架构，如 `["arm64", "riscv64"]`。
+每个 DEB 的 `Architecture` 必须属于这个列表，发布记录则只声明该 DEB 的一个架构。
+架构无关包使用 `["all"]`，不能与具体架构混用；拒绝架构通配符和 `source`。
+新记录使用 `releases/<version>_<architecture>.json`，兼容现有 `<version>.json`。
+同版本不同架构可以并存；同版本同架构仍需先下架、再 `publish --force`。
+发布前先合并 `packages` 的校验器与 schema 更新，再更新 LPM。
 完整规则见[配置文档](docs/configuration.md)。
+
+```sh
+# 自动选择 dist 中匹配当前包名、版本和各架构的包，提交一个 PR
+lpm publish --all-architectures
+# 或明确指定两个产物
+lpm publish dist/lilygo-ui-demo_1.0.0_arm64.deb dist/lilygo-ui-demo_1.0.0_riscv64.deb
+# 仅下架其中一个架构
+lpm unpublish 1.0.0 --arch riscv64 --reason "K230 startup failure"
+```
+
+多架构项目执行 `publish` 时可以先通过 `set-target` 保存平台，或指定文件、`--arch`
+或 `--all-architectures`；`deploy` 使用保存的单个平台，也可指定 `--arch` 或目标架构的
+DEB 路径，避免从共享 `dist` 误选最新包。
 
 `publish --runtime` 会读取 DEB control 中的包名、版本和架构，把类似 `meshtasticd`
 的运行库提交到 `runtimes/<package>/`；它可以从应用源码仓库执行，因为运行库身份

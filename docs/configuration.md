@@ -186,7 +186,7 @@ external-display
 
 | 字段 | 类型 | 必填 | 约束 |
 | --- | --- | --- | --- |
-| `architectures` | string array | 是 | 恰好一个架构名，例如 `["arm64"]`、`["amd64"]`、`["armhf"]`、`["riscv64"]` 或 `["all"]` |
+| `architectures` | string array | 是 | 1–64 个不重复的具体架构名，例如 `["arm64", "riscv64"]`；架构无关包使用单独的 `["all"]` |
 | `min_appkit_version` | string | 是 | 最低 AppKit 版本，最长 128 字符；格式为三段版本号，可带 prerelease 和 build 信息 |
 
 合法示例包括 `0.1.0`、`1.2.0-rc.1` 和 `1.2.0+build.4`。
@@ -194,9 +194,9 @@ external-display
 架构名最长 64 字符，由小写字母、数字和分隔各段的单个连字符组成；
 支持 `hurd-i386` 这类名称。不维护 CPU 名称白名单，但拒绝 `source`、`any`
 以及 `linux-any`、`any-amd64` 等含 `any` 段的架构通配符。
-发布时还会检查 DEB 的 `Architecture` 与配置精确一致。
+发布时还会检查 DEB 的 `Architecture` 属于配置列表，单个发布记录只声明该包的一个架构。
 架构无关包必须声明 `["all"]`，不会自动匹配声明为 `["arm64"]` 的项目。
-每个包版本仍只存储一个 DEB，不能用另一架构覆盖或追加已存在的同一版本。
+同一版本的不同架构分别存储在 `<version>_<architecture>.json`，已有 `<version>.json` 继续有效。同一包／版本／架构不能重复；`all` 不能与具体架构共享同一版本。
 
 ### `[project.launcher]`
 
@@ -306,7 +306,8 @@ CMake 后端的字段可省略，并使用表中的默认值。脚本后端需�
 | --- | --- | --- | --- |
 | `backend` | string | `cmake` | `cmake` 或 `script`；决定 `test` 和 `pack` 的工作流 |
 | `host_preset` | string | `host-simulator` | `start` 和 CMake `test` 使用的 configure/build preset |
-| `cross_preset` | string | `cm0-cross` | CMake `pack` 使用的 configure/build preset |
+| `cross_preset` | string | `cm0-cross` | 未指定架构时 CMake `pack` 的默认 configure/build preset |
+| `cross_presets` | table | 无 | Debian 架构到 configure/build preset 的映射，每个架构使用不同 preset |
 | `test_command` | string array | 无 | 脚本后端的测试命令，必须包含独立参数 `{report}` |
 | `pack_command` | string array | 无 | 脚本后端的打包命令，必须包含独立参数 `{output}` |
 | `package_dir` | string | `dist` | `pack` 的默认输出目录，以及 `deploy` 和 `publish` 的默认包搜索目录 |
@@ -314,9 +315,31 @@ CMake 后端的字段可省略，并使用表中的默认值。脚本后端需�
 覆盖关系：
 
 - `lpm start --preset` 和 `lpm test --preset` 覆盖 `host_preset`。
-- `lpm pack --preset` 覆盖 `cross_preset`。
+- `lpm set-target cm0|k230|all` 把平台保存到项目的 `.lpm/target.json`，供后续架构相关命令使用；不会改写 `lpm.toml`。`cm0` 对应 `arm64`，`k230` 对应 `riscv64`，`all` 表示全部声明架构。
+- 显式 `--arch`、`--all-architectures`、`lpm pack --preset` 或包文件路径优先于保存的目标；`lpm pack --preset` 同时覆盖 `cross_preset`。
 - `lpm pack --output` 覆盖 `package_dir`，但不会永久修改配置。
-- `lpm deploy` 或 `lpm publish` 未显式指定包时，会递归选择 `package_dir` 下修改时间最新的 `.deb`。
+- 未保存目标的单架构项目未指定包或架构时，`deploy` / `publish` 选择最新 `.deb`。多架构 `deploy` 使用保存的单平台目标，或传入文件、`--arch`；`publish` 使用保存的目标，或传入文件、`--arch`、`--all-architectures`。按架构部署时，根据 DEB control 中的架构、项目包名和配置版本选择最新匹配包。
+
+### 双平台 CMake 打包
+
+```toml
+[build.cross_presets]
+arm64 = "cm0-cross"
+riscv64 = "k230-debian"
+```
+
+`lpm pack --arch riscv64` 选择对应 preset；`lpm pack --all-architectures`
+按 `project.compatibility.architectures` 的顺序逐一构建，所有架构必须有映射。
+`--all-architectures` 不能与 `--arch` 或 `--preset` 混用；`--arch` 与 `--preset`
+同时指定时必须与映射一致。未保存目标时，`lpm pack` 仍选择 `cross_preset`，若其存在映射，也会校验产物架构。
+单架构项目没有 `cross_presets` 时，目标选择可复用原有 `cross_preset`。
+各 preset 的构建目录使用 `build/<preset>`。Debian K230 使用 `k230-debian`，
+不能把 Buildroot 的 `k230-cross` 映射为 Debian 打包目标。
+
+多架构 `metadata --format cmake` 输出 `LILYGO_UI_PACKAGE_ARCHITECTURES`，不再把
+第一个架构赋给 `LILYGO_UI_PACKAGE_ARCHITECTURE`。应用 CMake 应根据实际工具链的
+`LILYGO_UI_DEBIAN_ARCHITECTURE` 设置 CPack 架构。`metadata --arch riscv64` 可输出
+单架构元数据；单架构项目的原有变量保持兼容。
 
 ### 脚本命令约定
 
@@ -402,7 +425,7 @@ Include ~/.ssh/config
 只要该文件存在，LPM 就会为当前项目的 `ssh` 和 `scp` 加上
 `-F .lpm/ssh_config`。该文件会替代命令默认读取的 `~/.ssh/config`；如需同时使用全局配置，应显式添加 `Include ~/.ssh/config`。
 
-`.lpm/` 还包含模拟器状态、日志和测试报告，通常应加入 `.gitignore`。不要把私钥放入项目目录或提交到版本库。
+`.lpm/` 还包含 `set-target` 保存的 `target.json`、模拟器状态、日志和测试报告，通常应加入 `.gitignore`。删除 `target.json` 可恢复未设置平台时的默认选择。不要把私钥放入项目目录或提交到版本库。
 
 ## GitHub 认证
 

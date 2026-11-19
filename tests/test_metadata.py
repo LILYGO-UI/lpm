@@ -112,11 +112,11 @@ class MetadataTests(unittest.TestCase):
                         render_cmake_metadata(project),
                     )
 
-    def test_invalid_or_multiple_architectures_are_rejected(self) -> None:
+    def test_invalid_architectures_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             project = make_project(Path(temp))
             for architectures in (
-                [], ["arm64", "amd64"], ["arm64", "arm64"], ["all", "arm64"],
+                [], ["arm64", "arm64"], ["all", "arm64"],
                 "arm64", [None], [64], [{}], [""], ["ARM64"], ["x86_64"],
                 [" arm64"], ["arm64\n"], ["-arm64"], ["arm64-"], ["linux--arm64"],
                 ["source"], ["any"], ["linux-any"], ["any-amd64"],

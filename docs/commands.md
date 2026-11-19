@@ -23,6 +23,8 @@
 ```text
 命令行显式参数
         ↓
+项目保存的目标平台（支持架构选择的命令）
+        ↓
 lpm.toml 对应字段
         ↓
 LPM 内置默认值
@@ -39,6 +41,7 @@ LPM 在使用外部工具前通过当前 `PATH` 查找可执行文件。找不�
 | LPM 命令 | 外部命令 |
 | --- | --- |
 | `init` | 远程模板需要 `git`；本地模板不需要 |
+| `set-target` | 无 |
 | `start` | 构建时需要 `cmake`；`--no-build` 不需要；配置的 `[run].prepare_command` 使用其数组中的程序 |
 | `stop` | Unix 信号；进程校验可能调用 `ps` |
 | `test` | CMake 后端：`cmake`、`ctest`；脚本后端：`build.test_command` 指定的程序 |
@@ -61,6 +64,7 @@ LPM 在使用外部工具前通过当前 `PATH` 查找可执行文件。找不�
 | 命令 | 核心职责 | 主要输入 | 主要产物或状态 |
 | --- | --- | --- | --- |
 | `lpm init` | 从模板创建独立应用项目 | 路径、名称、版本、描述、模板 | 新项目目录和定制后的 `lpm.toml` |
+| `lpm set-target` | 保存当前项目的默认目标平台 | `cm0`、`k230`、`all` | `.lpm/target.json` |
 | `lpm metadata` | 校验并派生项目元数据 | `lpm.toml [project]` | CMake 文本或 publish JSON |
 | `lpm start` | 构建、准备并运行主机模拟器 | host preset、可执行文件、运行参数、`[run]` | 模拟器进程、日志和 PID 状态 |
 | `lpm stop` | 安全停止后台模拟器 | PID 状态、超时 | 清理模拟器 PID 状态 |
@@ -120,10 +124,38 @@ lpm init [PATH] \
 - 模板中的作者、资源、权限、兼容性等非身份字段会被保留，但它们也必须通过校验。
 - LPM 不初始化新的 Git 仓库；远程模板自身的 `.git` 不会复制到目标项目。
 
+## `lpm set-target`
+
+```sh
+lpm set-target cm0
+lpm set-target k230
+lpm set-target all
+```
+
+从当前目录查找项目，原子写入 `<project>/.lpm/target.json`。该文件只保存
+`{"target": "cm0"}` 这样的本地选择，不修改 `lpm.toml`，不同项目互不影响。
+`cm0` 映射为 `arm64`，`k230` 映射为 `riscv64`，`all` 表示项目声明的全部架构，
+与 Debian 架构无关包的 `all` 类型不同。
+
+| 后续命令 | 保存单个平台 | 保存 `all` |
+| --- | --- | --- |
+| CMake `pack` | 使用对应架构的 preset | 按全部声明的架构顺序打包 |
+| `metadata` | 输出该架构的元数据 | 输出完整元数据 |
+| `publish` | 自动选择该架构的包 | 发布全部声明架构的包到同一个 PR |
+| `deploy`、`unpublish` | 使用该架构 | 报错提示切换单个平台或传入 `--arch` |
+
+显式 `--arch`、`--all-architectures`、`pack --preset` 或包路径优先于保存的目标，
+并且不修改保存值。显式包路径仍可配合 `--arch` 校验包架构。
+未保存目标时沿用原有默认行为。文件损坏时给出错误，可重新执行 `set-target` 修复。
+
+`start`、`stop`、`test` 保留主机流程；脚本后端 `pack` 的平台由脚本配置决定。
+`deploy --target` 独立选择 SSH 别名，不随 `set-target` 改变。
+运行库 `publish` 的既有约束继续适用：批量发布必须显式传入包文件路径。
+
 ## `lpm metadata`
 
 ```sh
-lpm metadata --format cmake|publish-json [--output PATH]
+lpm metadata --format cmake|publish-json [--arch ARCH] [--output PATH]
 ```
 
 ### 执行流程
@@ -149,9 +181,11 @@ lpm metadata --format cmake|publish-json [--output PATH]
 默认 CMake 后端中，`start`、`test` 和 `pack` 复用同一个 configure/build 流程：
 
 ```sh
-cmake --preset <preset>
+cmake --preset <preset> -DLPM_EXECUTABLE:FILEPATH=<current-lpm>
 cmake --build --preset <preset> --parallel
 ```
+
+配置时显式指定当前运行的 LPM 入口，覆盖旧 CMake 缓存或项目 `.venv` 中的入口，避免项目搬迁后虚拟环境脚本仍引用旧 Python 路径。使用 `python -m lpm` 时，在 `.lpm/cmake-lpm` 生成绑定当前 Python 解释器和 LPM 源码路径的启动脚本，保证 CMake 读取元数据时使用同一版本。
 
 配置失败时不会进入构建；构建失败时不会进入启动、测试或打包阶段。LPM 不自动清理构建目录，也不隐式重新初始化 Git submodule 或安装编译依赖。
 
@@ -259,7 +293,7 @@ ctest --preset <preset> \
 
 设置 `build.backend = "script"` 后跳过 CMake 和 CTest：
 
-1. 拒绝 `--preset`，要求非空的 `build.test_command` 参数数组及独立的 `{report}` 参数。
+1. 拒绝 `--preset`、`--arch`、`--all-architectures`，要求非空的 `build.test_command` 参数数组及独立的 `{report}` 参数。
 2. 解析报告的绝对路径并创建父目录；旧报告不能充当本次结果。
 3. 将独立参数 `{python}` 替换为运行 LPM 的解释器，`{report}` 替换为报告路径。
 4. 从项目根目录直接执行参数数组，不经过 shell，不展开 shell 变量或嵌入字符串的占位符。
@@ -270,12 +304,15 @@ ctest --preset <preset> \
 ## `lpm pack`
 
 ```sh
-lpm pack [--preset PRESET] [--output DIRECTORY]
+lpm pack [--preset PRESET] [--arch ARCH | --all-architectures] [--output DIRECTORY]
 ```
+
+可用 `CMAKE_BUILD_PARALLEL_LEVEL=4 lpm pack` 限制同时编译的任务数量。
+LPM 会保留该环境变量交给 CMake 处理；未设置时沿用构建工具的默认并行行为。
 
 ### 执行流程
 
-1. 选择 preset：`--preset`、`build.cross_preset`、`cm0-cross`。
+1. 先按显式参数、保存目标的顺序选择架构。单架构使用 `build.cross_presets`；全部架构要求所有声明的架构都有映射并顺序构建。只有一个声明架构且没有映射的旧项目可继续使用 `build.cross_preset`。没有目标或架构选择时按 `--preset`、`build.cross_preset`、`cm0-cross` 选择。
 2. 执行共享 CMake configure/build 阶段。
 3. 选择输出目录：`--output`、`build.package_dir`、`dist`，并创建目录。
 4. 要求 `build/<preset>/CPackConfig.cmake` 已由配置阶段生成。
@@ -288,13 +325,15 @@ cpack --config build/<preset>/CPackConfig.cmake -B <output>
 6. 递归扫描输出目录，只收集本次 CPack 执行期间生成或更新的 `.deb`。
 7. 排除 `_CPack_Packages` 内部 staging 副本，按修改时间排序并逐个输出最终包路径。
 
+按架构打包时，每次 CPack 使用独立临时目录；核对实际 Debian control 包名、版本和架构后，再复制到输出目录的 `<package>_<version>_<architecture>.deb`。
+
 CPack 成功但没有发现新的 Debian 包时，LPM 仍判定 `pack` 失败。LPM 当前只返回 `.deb`，不会把其他 CPack generator 的产物作为成功结果。
 
 ### 脚本后端
 
 设置 `build.backend = "script"` 后跳过 CMake 和 CPack：
 
-1. 拒绝 `--preset`，要求非空的 `build.pack_command` 参数数组及独立的 `{output}` 参数。
+1. 拒绝 `--preset`、`--arch`、`--all-architectures`，要求非空的 `build.pack_command` 参数数组及独立的 `{output}` 参数。
 2. 按 `--output`、`build.package_dir`、`dist` 选择输出目录，解析为绝对路径并创建目录。
 3. 记录目录内已有包，将独立参数 `{python}` 替换为运行 LPM 的解释器，`{output}` 替换为输出目录。
 4. 从项目根目录直接执行参数数组，不经过 shell。
@@ -306,6 +345,7 @@ CPack 成功但没有发现新的 Debian 包时，LPM 仍判定 `pack` 失败。
 
 ```sh
 lpm deploy [PACKAGE.deb] \
+  [--arch ARCH] \
   [--host HOST | --target SSH_ALIAS] \
   [--user USER] \
   [--port PORT] \
@@ -316,10 +356,11 @@ lpm deploy [PACKAGE.deb] \
 
 ### 包选择
 
-1. 指定 `PACKAGE.deb` 时，相对于执行命令的工作目录解析。
-2. 未指定时，在 `<project>/<build.package_dir>/` 下递归选择修改时间最新的 `.deb`。
-3. 默认目录是 `dist`。
-4. 文件必须存在且扩展名精确为 `.deb`。
+1. 指定 `PACKAGE.deb` 时，相对于执行命令的工作目录解析；同时传入 `--arch` 会在上传前核对 DEB control 中的实际架构。
+2. 保存了单平台目标或指定 `--arch`，且未指定文件时，读取 DEB control 元数据，按架构、项目包名和配置版本筛选，再选择修改时间最新的匹配包。不会仅根据文件名判断架构。
+3. 未保存目标的单架构项目未指定文件及架构时，在 `<project>/<build.package_dir>/` 下递归选择修改时间最新的 `.deb`。多架构项目需要保存的单平台目标、`--arch` 或 DEB 路径。自动选择均排除 `_CPack_Packages` 暂存目录。
+4. 默认目录是 `dist`。
+5. 文件必须存在且扩展名精确为 `.deb`。声明了兼容架构的项目只接受已声明的 `--arch`。
 
 ### 目标选择
 
@@ -381,6 +422,8 @@ ssh [SSH_OPTIONS] <user@host> 'set -e; sudo -- apt-get install --reinstall --yes
 | 路径 | 创建者 | 生命周期与用途 |
 | --- | --- | --- |
 | `lpm.toml` | 模板、`init`、开发者 | 应用身份和发布信息的唯一入口；运行库包名及工作流配置 |
+| `.lpm/target.json` | `set-target` | 当前项目的默认平台，跨终端保留；删除后恢复原有默认选择 |
+| `.lpm/cmake-lpm` | CMake 构建阶段 | 模块调用模式下生成的 LPM 入口，后续构建自动更新 |
 | `.lpm/simulator.json` | 后台 `start` | 当前模拟器 PID 和身份；成功 `stop` 后删除 |
 | `.lpm/simulator.log` | 后台 `start` | 模拟器 stdout/stderr，采用追加写入 |
 | `.lpm/test-results.xml` | `test` / 项目测试脚本 | 默认 JUnit 报告，可由 `--report` 覆盖 |
@@ -443,11 +486,14 @@ LPM 创建凭证目录时使用 `0700` 权限，凭证文件使用 `0600` 权限
 ## `lpm publish`
 
 ```sh
-lpm publish [PACKAGE.deb] [--runtime] [--force]
+lpm publish [PACKAGE.deb ...] [--arch ARCH | --all-architectures] [--runtime] [--force]
 ```
 
-未指定包时，按 `deploy` 相同的规则选择 `build.package_dir` 中修改时间最新的
-`.deb`。显式传入的相对路径以执行命令时的工作目录为基准。发布不会自动运行
+单架构项目未指定包时，选择 `build.package_dir` 中修改时间最新的 `.deb`。
+多架构项目使用保存的目标，或指定文件、`--arch`、`--all-architectures`；按架构自动选择时，
+每个请求的架构必须恰好找到一个匹配当前包名和版本的 DEB，忽略 `_CPack_Packages`。
+显式多文件必须具有相同包名和版本，且架构不重复；运行库批量发布需显式传入文件。
+显式传入的相对路径以执行命令时的工作目录为基准。发布不会自动运行
 `pack`，也不会使用预先生成的 `publish.json`。
 
 ### 本地阶段
@@ -460,23 +506,23 @@ lpm publish [PACKAGE.deb] [--runtime] [--force]
 5. 图标和截图改写为 `assets/sha256/<prefix>/<digest>.<ext>`，避免不同版本覆盖
    同名资源。图标最大 1 MiB，单张截图最大 2 MiB。
 
-`project.compatibility.architectures` 必须恰好包含一个架构名，例如 `["amd64"]`、
-`["armhf"]` 或 `["all"]`。`all` 必须与包内字段精确匹配；`source`、`any`
-和架构通配符不适用于发布的二进制包。完整名称规则见 [配置文档](configuration.md)。
-中央 `packages` 的架构 schema 更新必须先合并到默认分支，新架构发布 PR 才能通过
-受信任的基础版本校验。
+`project.compatibility.architectures` 可声明 `["arm64", "riscv64"]`；DEB 必须匹配
+其中一个架构。发布时每个记录的 manifest 只包含该 DEB 的一个架构。
+`all` 单独声明；禁止 `source`、`any` 和架构通配符。
+中央 `packages` 校验器与 schema 更新必须先合并到默认分支，发布 PR 才能使用新格式。
 
 ### GitHub 阶段
 
 1. 读取 `LILYGO-UI/packages` 默认分支和当前 GitHub 用户。
 2. 创建或复用 `<user>/packages` Fork，并确认它的 parent/source 是中央仓库；如果 Fork 的默认分支落后于中央默认分支，先执行快进同步。
 3. 从中央默认分支创建唯一发布分支，提交 `app.json`、版本记录和资源。
-4. 在 Fork 创建公开 prerelease，把 `.deb` 作为 Release asset 上传。
+4. 在 Fork 为每个 DEB 创建公开 prerelease 并上传，所有包写入同一提交和同一个 PR。全部本地校验与已发布记录检查通过后才开始写入。
 5. 向中央默认分支创建发布 Pull Request，输出 URL 和 `pending_review` 状态。
 
 首次发布会创建应用所有权文件，唯一 owner 是 PR 作者。已有应用要求当前 GitHub
-用户在 owner 列表中。默认拒绝覆盖已存在的版本，即使该版本已下架。
-每个包版本仍只对应一个当前 DEB，不能用另一架构替换。
+用户在 owner 列表中。默认拒绝覆盖已存在的同版本同架构记录，即使已下架。
+新记录路径为 `releases/<version>_<architecture>.json`。兼容旧 `<version>.json`，
+若旧记录对应当前架构则仍更新原路径；追加另一架构使用新路径，不改旧记录。
 
 Fork prerelease 是审核暂存区，不是 AppStore 的正式下载位置。PR 合并后，中央仓库
 Action 会重新下载并验证包，把它转存到 `apt-pool-<package>` Release；只有转存
@@ -507,12 +553,13 @@ PR 校验使用基础提交中的受信任代码，仅重跑旧工作流不会�
 ## `lpm unpublish`
 
 ```sh
-lpm unpublish VERSION --reason REASON
+lpm unpublish VERSION [--arch ARCH] --reason REASON
 ```
 
 `VERSION` 必须是合法的 Debian 版本，但不必等于本地 `project.version`；它指定中央
 Registry 中要下架的历史版本。`REASON` 去除首尾空白后必须为 1 到 500 个字符，并会
-公开出现在版本记录和 Pull Request 中。
+公开出现在版本记录和 Pull Request 中。多架构应用需要保存的单平台目标或显式 `--arch`；
+单架构应用可推断架构。运行库的新格式记录需传入 `--arch`，旧版记录可省略。
 
 该命令要求当前 GitHub 用户是应用 owner，然后读取中央版本记录并创建 Fork 分支和
 Pull Request。变更只能把 `status` 从 `published` 改为 `yanked`，同时写入公开原因

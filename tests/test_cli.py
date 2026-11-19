@@ -17,6 +17,11 @@ from lpm.registry import Submission
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        target_mock = patch("lpm.targets.load_target", return_value=None)
+        target_mock.start()
+        self.addCleanup(target_mock.stop)
+
     @patch("lpm.cli.github_login")
     def test_login_uses_github_device_flow(self, login_mock) -> None:
         with redirect_stdout(io.StringIO()):
@@ -63,6 +68,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(deploy_mock.call_args.kwargs["target"], "cm0-lab")
         self.assertIsNone(deploy_mock.call_args.kwargs["host"])
+
+    @patch("lpm.cli.find_project")
+    @patch("lpm.cli.deploy")
+    def test_deploy_forwards_architecture(self, deploy_mock, project_mock) -> None:
+        deploy_mock.return_value = Path("/tmp/demo_riscv64.deb")
+        with redirect_stdout(io.StringIO()):
+            code = main([
+                "deploy", "--arch", "riscv64", "--host", "192.168.8.151", "--user", "wing"
+            ])
+        self.assertEqual(code, 0)
+        self.assertEqual(deploy_mock.call_args.kwargs["architecture"], "riscv64")
+        self.assertEqual(deploy_mock.call_args.kwargs["host"], "192.168.8.151")
+        self.assertEqual(deploy_mock.call_args.kwargs["user"], "wing")
 
     @patch("lpm.cli.find_project")
     @patch("lpm.cli.generate_metadata", return_value='{"package":"lilygo-ui-demo"}\n')

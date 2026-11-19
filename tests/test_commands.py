@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 from lpm.commands import (
+    configure_and_build,
     deploy,
     initialize,
     pack,
@@ -114,6 +115,27 @@ class InitializeTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    @patch("lpm.commands.run")
+    @patch("lpm.commands.require_tool")
+    def test_build_preserves_cmake_environment_parallel_limit(self, tool: Mock, run_mock: Mock) -> None:
+        for limit in ("4", ""):
+            with self.subTest(limit=limit), patch.dict(os.environ, {"CMAKE_BUILD_PARALLEL_LEVEL": limit}):
+                run_mock.reset_mock()
+                configure_and_build(self.project, "k230-debian")
+                run_mock.assert_called_with(
+                    ["cmake", "--build", "--preset", "k230-debian"], cwd=self.root
+                )
+
+    @patch("lpm.commands.run")
+    @patch("lpm.commands.require_tool")
+    def test_build_uses_native_parallel_default_without_environment_limit(self, tool: Mock, run_mock: Mock) -> None:
+        with patch.dict(os.environ):
+            os.environ.pop("CMAKE_BUILD_PARALLEL_LEVEL", None)
+            configure_and_build(self.project, "k230-debian")
+        run_mock.assert_called_with(
+            ["cmake", "--build", "--preset", "k230-debian", "--parallel"], cwd=self.root
+        )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)

@@ -97,6 +97,7 @@ class FakeGitHub:
         release_path = next(
             path for path in files
             if "/releases/" in path and path.endswith(".json")
+            and json.loads(files[path])["artifact"]["source"]["asset"] == name
         )
         release_record = json.loads(files[release_path])
         return release_record["artifact"]["source"]["url"]
@@ -158,7 +159,7 @@ class RegistryTests(unittest.TestCase):
         )
         files = client.commits[0]["files"]
         self.assertIn("apps/lilygo-ui-demo/app.json", files)
-        release = json.loads(files["apps/lilygo-ui-demo/releases/1.2.3.json"])
+        release = json.loads(files["apps/lilygo-ui-demo/releases/1.2.3_arm64.json"])
         self.assertEqual(release["submitted_by"], "alice")
         self.assertEqual(release["artifact"]["sha256"], "d" * 64)
         self.assertEqual(
@@ -188,7 +189,7 @@ class RegistryTests(unittest.TestCase):
                 client = FakeGitHub()
                 result = publish(self.project, package_path=self.package, client=client)
                 release = json.loads(
-                    client.commits[0]["files"]["apps/lilygo-ui-demo/releases/1.2.3.json"]
+                    client.commits[0]["files"][f"apps/lilygo-ui-demo/releases/1.2.3_{architecture}.json"]
                 )
                 self.assertEqual(release["artifact"]["architecture"], architecture)
                 self.assertEqual(
@@ -211,7 +212,7 @@ class RegistryTests(unittest.TestCase):
                 client.current_user.assert_not_called()
 
     @patch("lpm.registry.inspect_debian_package")
-    def test_publish_cannot_replace_existing_version_with_another_architecture(self, inspect: Mock) -> None:
+    def test_publish_adds_another_architecture_without_replacing_legacy_record(self, inspect: Mock) -> None:
         self.project.data["project"]["compatibility"]["architectures"] = ["amd64"]
         inspect.return_value = DebianArtifact(
             self.package, "lilygo-ui-demo", "1.2.3", "amd64", 1, "d" * 64
@@ -220,10 +221,10 @@ class RegistryTests(unittest.TestCase):
         client.registry_files["apps/lilygo-ui-demo/releases/1.2.3.json"] = {
             "artifact": {"architecture": "arm64"},
         }
-        with self.assertRaisesRegex(LpmError, "already exists"):
-            publish(self.project, package_path=self.package, client=client)
-        self.assertEqual(client.commits, [])
-        self.assertEqual(client.pull_requests, [])
+        publish(self.project, package_path=self.package, client=client)
+        files = client.commits[0]["files"]
+        self.assertIn("apps/lilygo-ui-demo/releases/1.2.3_amd64.json", files)
+        self.assertNotIn("apps/lilygo-ui-demo/releases/1.2.3.json", files)
 
     @patch("lpm.registry.inspect_debian_package")
     def test_publish_force_replaces_yanked_package_at_same_version(self, inspect: Mock) -> None:
@@ -263,9 +264,10 @@ class RegistryTests(unittest.TestCase):
             [
                 ("apps/lilygo-ui-demo/app.json", "a" * 40),
                 ("apps/lilygo-ui-demo/releases/1.2.3.json", "a" * 40),
+                ("apps/lilygo-ui-demo/releases/1.2.3_arm64.json", "a" * 40),
             ],
         )
-        self.assertEqual(client.pull_requests[0]["title"], "Republish lilygo-ui-demo 1.2.3")
+        self.assertEqual(client.pull_requests[0]["title"], "Republish lilygo-ui-demo 1.2.3 (arm64)")
         self.assertIn("a" * 64, client.pull_requests[0]["body"])
         self.assertIn("d" * 64, client.pull_requests[0]["body"])
 
@@ -321,6 +323,7 @@ class RegistryTests(unittest.TestCase):
                     client.registry_files[app_path]["app_id"] = "cc.lilygo.ui.Other"
                 elif mismatch == "architecture":
                     previous["artifact"]["architecture"] = "amd64"
+                    client.registry_files["apps/lilygo-ui-demo/releases/1.2.3_arm64.json"] = previous
                 else:
                     previous["manifest"][mismatch] = "other"
                 with self.assertRaisesRegex(LpmError, message):
@@ -335,7 +338,7 @@ class RegistryTests(unittest.TestCase):
         )
         client = FakeGitHub()
         publish(self.project, package_path=self.package, force=True, client=client)
-        self.assertEqual(client.pull_requests[0]["title"], "Publish lilygo-ui-demo 1.2.3")
+        self.assertEqual(client.pull_requests[0]["title"], "Publish lilygo-ui-demo 1.2.3 (arm64)")
 
     def test_unpublish_only_changes_release_state(self) -> None:
         client = FakeGitHub()
@@ -348,7 +351,7 @@ class RegistryTests(unittest.TestCase):
             "status": "published",
             "submitted_by": "alice",
             "manifest": {"version": "1.2.3"},
-            "artifact": {"sha256": "d" * 64},
+            "artifact": {"sha256": "d" * 64, "architecture": "arm64"},
         }
         client.registry_files["apps/lilygo-ui-demo/releases/1.2.3.json"] = original
 
@@ -406,7 +409,7 @@ class RegistryTests(unittest.TestCase):
         result = publish(runtime, package_path=self.package, client=client)
         files = client.commits[0]["files"]
         self.assertIn("runtimes/meshtasticd/runtime.json", files)
-        release_path = "runtimes/meshtasticd/releases/2.8.0.0~local4528018+lr2021cad1.json"
+        release_path = "runtimes/meshtasticd/releases/2.8.0.0~local4528018+lr2021cad1_arm64.json"
         release = json.loads(files[release_path])
         self.assertEqual(release["manifest"]["package"], "meshtasticd")
         self.assertEqual(release["manifest"]["version"], "2.8.0.0~local4528018+lr2021cad1")
@@ -435,7 +438,7 @@ class RegistryTests(unittest.TestCase):
         files = client.commits[0]["files"]
         self.assertIn("runtimes/meshtasticd/runtime.json", files)
         self.assertIn(
-            "runtimes/meshtasticd/releases/2.8.0.0~local4528018+lr2021cad1.json",
+            "runtimes/meshtasticd/releases/2.8.0.0~local4528018+lr2021cad1_arm64.json",
             files,
         )
         self.assertEqual(result.package, "meshtasticd")

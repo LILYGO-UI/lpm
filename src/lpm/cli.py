@@ -24,6 +24,7 @@ from .config import find_project
 from .errors import LpmError
 from .github import github_login
 from .registry import publish, unpublish
+from .targets import TARGET_ARCHITECTURES, resolve_target, save_target
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,6 +55,15 @@ def build_parser() -> argparse.ArgumentParser:
         "-y", "--yes", action="store_true", help="accept inferred defaults"
     )
     init_parser.set_defaults(handler=_handle_init)
+
+    target_parser = subparsers.add_parser(
+        "set-target", help="save the default platform for this project"
+    )
+    target_parser.add_argument(
+        "target", choices=tuple(TARGET_ARCHITECTURES),
+        help="cm0 (arm64), k230 (riscv64), or all declared architectures",
+    )
+    target_parser.set_defaults(handler=_handle_set_target)
 
     start_parser = subparsers.add_parser(
         "start", help="build and start the host simulator"
@@ -94,6 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pack_parser.add_argument("--preset", help="CMake cross-build preset")
     pack_parser.add_argument("--output", type=Path, help="package output directory")
+    pack_arch = pack_parser.add_mutually_exclusive_group()
+    pack_arch.add_argument("--arch", help="Debian architecture; overrides the saved target")
+    pack_arch.add_argument("--all-architectures", action="store_true", help="build every declared architecture")
     pack_parser.set_defaults(handler=_handle_pack)
 
     metadata_parser = subparsers.add_parser(
@@ -105,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     metadata_parser.add_argument(
         "--output", type=Path, help="write output to a file instead of stdout"
     )
+    metadata_parser.add_argument("--arch", help="select one declared Debian architecture; overrides the saved target")
     metadata_parser.set_defaults(handler=_handle_metadata)
 
     deploy_parser = subparsers.add_parser(
@@ -113,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument(
         "package", nargs="?", type=Path, help="package; defaults to newest in dist"
     )
+    deploy_parser.add_argument("--arch", help="select a Debian architecture from dist; overrides the saved target")
     destination_group = deploy_parser.add_mutually_exclusive_group()
     destination_group.add_argument("--host", help="target hostname or IPv4 address")
     destination_group.add_argument(
@@ -135,8 +150,11 @@ def build_parser() -> argparse.ArgumentParser:
         "publish", help="stage a Debian package in a fork and create a registry PR"
     )
     publish_parser.add_argument(
-        "package", nargs="?", type=Path, help="package; defaults to newest in dist"
+        "packages", nargs="*", type=Path, help="Debian packages of one version, one per architecture"
     )
+    publish_arch = publish_parser.add_mutually_exclusive_group()
+    publish_arch.add_argument("--arch", help="publish one Debian architecture; overrides the saved target")
+    publish_arch.add_argument("--all-architectures", action="store_true", help="publish every declared architecture in one PR")
     publish_parser.add_argument(
         "--force",
         action="store_true",
@@ -154,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unpublish_parser.add_argument("version", help="published Debian version")
     unpublish_parser.add_argument("--reason", required=True, help="public yank reason")
+    unpublish_parser.add_argument("--arch", help="architecture to yank; overrides the saved target")
     unpublish_parser.set_defaults(handler=_handle_unpublish)
     return parser
 
@@ -204,6 +223,15 @@ def _handle_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_set_target(args: argparse.Namespace) -> int:
+    project = find_project()
+    save_target(project, args.target)
+    architecture = TARGET_ARCHITECTURES[args.target]
+    description = architecture or "all declared architectures"
+    print(f"Target set to {args.target} ({description}) for {project.root}")
+    return 0
+
+
 def _handle_start(args: argparse.Namespace) -> int:
     project = find_project()
     arguments = args.arguments
@@ -238,14 +266,26 @@ def _handle_test(args: argparse.Namespace) -> int:
 
 
 def _handle_pack(args: argparse.Namespace) -> int:
-    packages = pack(find_project(), preset=args.preset, output=args.output)
+    project = find_project()
+    architecture, all_architectures = resolve_target(
+        project, command="pack", architecture=args.arch,
+        all_architectures=args.all_architectures,
+        explicit_selection=args.preset is not None or project.build_backend == "script",
+    )
+    packages = pack(
+        project, preset=args.preset, output=args.output,
+        architecture=architecture, all_architectures=all_architectures,
+    )
     for package in packages:
         print(f"Package: {package}")
     return 0
 
 
 def _handle_metadata(args: argparse.Namespace) -> int:
-    content = generate_metadata(find_project(), output_format=args.format)
+    project = find_project()
+    architecture, _ = resolve_target(project, command="metadata", architecture=args.arch)
+    options = {"architecture": architecture} if architecture else {}
+    content = generate_metadata(project, output_format=args.format, **options)
     if args.output:
         output = args.output.resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -257,9 +297,15 @@ def _handle_metadata(args: argparse.Namespace) -> int:
 
 
 def _handle_deploy(args: argparse.Namespace) -> int:
+    project = find_project()
+    architecture, _ = resolve_target(
+        project, command="deploy", architecture=args.arch,
+        explicit_selection=args.package is not None,
+    )
     package = deploy(
-        find_project(),
+        project,
         package=args.package,
+        architecture=architecture,
         host=args.host,
         target=args.target,
         user=args.user,
@@ -277,20 +323,37 @@ def _handle_login(args: argparse.Namespace) -> int:
 
 
 def _handle_publish(args: argparse.Namespace) -> int:
-    options = {"package_path": args.package, "force": args.force}
+    project = find_project()
+    architecture, all_architectures = resolve_target(
+        project, command="publish", architecture=args.arch,
+        all_architectures=args.all_architectures,
+        explicit_selection=bool(args.packages),
+    )
+    options = {"force": args.force}
+    if len(args.packages) > 1:
+        options["package_paths"] = args.packages
+    else:
+        options["package_path"] = args.packages[0] if args.packages else None
+    if architecture:
+        options["architecture"] = architecture
+    if all_architectures:
+        options["all_architectures"] = True
     if args.runtime:
         options["runtime"] = True
-    submission = publish(find_project(), **options)
+    submission = publish(project, **options)
     print(f"Submission: {submission.pull_request_url}")
     print("Status: pending_review")
     return 0
 
 
 def _handle_unpublish(args: argparse.Namespace) -> int:
+    project = find_project()
+    architecture, _ = resolve_target(project, command="unpublish", architecture=args.arch)
     submission = unpublish(
-        find_project(),
+        project,
         version=args.version,
         reason=args.reason,
+        architecture=architecture,
     )
     print(f"Submission: {submission.pull_request_url}")
     print("Status: pending_review")
